@@ -8,6 +8,7 @@ This document compiles and organizes strategic advice for extending the FSAKE (*
 1. [Conceptual Integration & Research Roadmap](#1-conceptual-integration--research-roadmap)
    * 1.5 [Critical Risks & Mitigation Strategies](#15-critical-risks--mitigation-strategies)
    * 1.6 [Paper Identity Statement](#16-paper-identity-statement) *(new)*
+   * 1.7 [Latent Mediator Transformer Integration](#17-latent-mediator-transformer-integration) *(new)*
    * ⚠ Risk 8: Topology Recovery Identifiability *(new)*
 2. [Experimental Strategy & Datasets](#2-experimental-strategy--datasets)
    * 2.3 [Synthetic Graph Recovery Experiment](#23-synthetic-graph-recovery-experiment-mandatory) *(new)*
@@ -17,6 +18,7 @@ This document compiles and organizes strategic advice for extending the FSAKE (*
    * 5.5 [Group E: Regularization & Sparsity](#55-group-e-regularization--sparsity) *(new)*
    * 5.6 [Group F: Overparameterization Robustness](#56-group-f-overparameterization-robustness) *(new)*
    * 5.7 [Group G: Sensitivity Analysis](#57-group-g-sensitivity-analysis) *(new)*
+   * 5.8 [Group H: Latent Mediator Transformer Ablation](#58-group-h-latent-mediator-transformer-ablation) *(new)*
 6. [Metrics, Logging, and Statistical Testing](#6-metrics-logging-and-statistical-testing)
 7. [Paper Outline Guide](#7-paper-outline-guide)
    * §7.3 Formal Problem Statement requirement *(new)*
@@ -38,11 +40,14 @@ This document compiles and organizes strategic advice for extending the FSAKE (*
 * **Step 3: Upgrade Knowledge Correction**: Introduce edge-level correction loss — **applied only to support–support edges** (where labels are known), never directly to support–query edges. This is critical to avoid label leakage (see Risk 5 in §1.5). Intra-class support pairs are pulled toward high cosine similarity; inter-class support pairs are pushed apart. The resulting learned topology then propagates to query nodes through message passing without ever using query labels as a supervision signal.
 * **Step 4: Full Architecture**: 
   1. Node features + edge incidence →
-  2. Edge features →
-  3. Dynamic reassignment (new topology) →
-  4. Node update →
-  5. Knowledge filtering (adaptive) →
+  2. Edge features $E = B^T X W$ →
+  3. Dynamic reassignment (learned topology $A'$) →
+  4. **Case 2 node update**: $X' = A_{edge} E W'$ (nodes updated from edge vectors, not neighboring node features) →
+  5. Knowledge gating (importance scores from aggregated edge features) →
   6. Skip connections.
+  
+  *Case 1* ($X' = \sigma(g(E)) \cdot A'H$) is retained as an ablation variant (A3). *Case 2* is the default for the full model (A4/A5).
+* **Step 5: Post-GNN Cross-Set Refinement via Latent Mediator Transformer (LMT)**: After all GNN layers, the separated support features $H_S$ and query features $H_Q$ are refined through a bottleneck mediator. A small set of $m \ll N$ learnable tokens $M$ aggregates from both sets (Phase A: Gather) and then broadcasts the summarized relational knowledge back (Phase B: Distribute). This replaces costly $O(N_q N_s)$ direct cross-attention with $O(m(N_q+N_s))$ complexity, while enabling *iterative bidirectional* refinement of both sets before prototype classification.
 
 ### 1.3 Theoretical Positioning
 To frame your novelty theoretically, make the following claims:
@@ -59,7 +64,50 @@ To frame your novelty theoretically, make the following claims:
 ### 1.4 Strategic Research Directions
 * **Direction 1 (Safe)**: Edge-driven FSAKE (Low risk, moderate novelty).
 * **Direction 2 (Stronger)**: Pure Edge-Centric Few-Shot Graph Learning (Remove Graph U-Net entirely).
-* **Direction 3 (Very Strong)**: Edge-Driven + Transformer Hybrid (Use edge topology to sparsify attention).
+* **Direction 3 (Very Strong)**: Edge-Driven + Transformer Hybrid (Use edge topology to sparsify attention; implemented as the Latent Mediator Transformer in §1.7).
+
+### 1.7 Latent Mediator Transformer Integration
+
+The **Latent Mediator Transformer (LMT)** is a post-GNN cross-set refinement module that replaces direct prototype classification with an iterative bidirectional information exchange between support and query features.
+
+#### Architecture
+
+A shared set of $m$ learnable mediator tokens $M \in \mathbb{R}^{m \times d}$ (with $m \ll N_q, N_s$) broker all communication between $H_Q$ (query) and $H_S$ (support) through two phases per layer $l$:
+
+**Phase A — Gather** (mediator distills joint context):
+$$M^{(l+1)} = \text{CrossAttn}\!\left(Q=M^{(l)},\ KV=[H_Q^{(l)} \| H_S^{(l)}]\right)$$
+
+**Phase B — Distribute** (sets receive mediator summary):
+$$H_Q^{(l+1)} = \text{CrossAttn}\!\left(Q=H_Q^{(l)},\ KV=M^{(l+1)}\right)$$
+$$H_S^{(l+1)} = \text{CrossAttn}\!\left(Q=H_S^{(l)},\ KV=M^{(l+1)}\right)$$
+
+This is repeated for $L_{lmt}$ layers (default 3), allowing the mediator to develop increasingly sophisticated relational summaries.
+
+#### Why This Is Label-Leakage Safe
+The LMT operates **after** the GNN layers on already-processed features. Query labels are never exposed — the mediator simply allows query tokens to pull relevant relational patterns from the support context. The prototype computation still uses only support labels. This is structurally equivalent to the Perceiver cross-attention setup, but episodically adapted.
+
+#### Complexity Advantage
+| Mechanism                            | Complexity per layer             |
+| ------------------------------------ | -------------------------------- |
+| Direct query↔support cross-attention | $O(N_q \cdot N_s \cdot d)$       |
+| LMT (via mediator)                   | $O(m \cdot (N_q + N_s) \cdot d)$ |
+
+For a 5-way 1-shot episode with 15 queries: direct attention = $15 \times 5 = 75$ pairs; LMT with $m=8$ = $8 \times 20 = 160$ operations — similar at small scale but **sub-quadratic** as ways/shots grow (e.g., 10-way 5-shot: direct = $15 \times 50 = 750$; LMT = $8 \times 65 = 520$).
+
+#### Key Hyperparameters
+* `n_mediators` ($m$): 8 (default) — controls bottleneck width. Too small → information loss; too large → approaches direct attention.
+* `lmt_layers` ($L_{lmt}$): 3 (default) — depth of iterative refinement.
+* `lmt_heads`: 4 — multi-head attention heads.
+
+#### Differentiation from Existing Approaches
+* **vs. standard Transformer cross-attention** (e.g., CrossTransformer FSL): Direct query-to-support attention has $O(N_q N_s)$ complexity and produces a one-shot (non-iterative) exchange. The LMT is iterative and uses a persistent learnable mediator.
+* **vs. Perceiver IO** (Jaegle et al., 2021): Perceiver uses a fixed latent array as a query over an input sequence. The LMT uses the mediator symmetrically for *both* sets and iterates the gather-distribute cycle — bidirectionality is the key structural difference.
+* **vs. ProtoNet + set-attention** (Ye et al., 2020): Set attention refines support features independently; LMT explicitly conditions both sets on a *shared* mediator, forcing cross-set co-adaptation.
+
+#### Integration Point in DEKAE
+The LMT is applied **between the GNN layers and prototype classification** (Step 8 in `DEKAEModel.forward`). It is controlled by the `use_lmt` flag for ablation studies (Group H, §5.8). The `set_use_lmt()` helper allows toggling it without re-initializing the model.
+
+---
 
 ### 1.5 Critical Risks & Mitigation Strategies
 
@@ -158,10 +206,10 @@ This section must be settled **before writing** — every design choice, ablatio
 
 This is not the same as "a dynamic GNN applied to FSL." The distinction matters to reviewers and must appear in the abstract, introduction, and conclusion:
 
-| Framing to Avoid | Correct Framing |
-| --- | --- |
-| "We improve FSAKE with a dynamic graph" | "We learn the relational structure of each episode, supervised by class-boundary evidence" |
-| "Our GNN uses learned adjacency" | "Our framework recovers topology that reflects true class structure, validated by structural metrics" |
+| Framing to Avoid                         | Correct Framing                                                                                            |
+| ---------------------------------------- | ---------------------------------------------------------------------------------------------------------- |
+| "We improve FSAKE with a dynamic graph"  | "We learn the relational structure of each episode, supervised by class-boundary evidence"                 |
+| "Our GNN uses learned adjacency"         | "Our framework recovers topology that reflects true class structure, validated by structural metrics"      |
 | "We get higher accuracy on miniImageNet" | "We show that structural recovery accuracy correlates with classification accuracy, validating the design" |
 
 **Three-point contribution list** (use this verbatim as a starting draft):
@@ -197,9 +245,9 @@ Reviewers of topology-learning methods expect a **controlled synthetic validatio
 **What this proves**: The experiment isolates topology recovery from classification accuracy. Your model succeeds *because it learns better relational structure*, not because it has more parameters or a more powerful backbone. This directly answers the anticipated reviewer critique: *"Is the learned graph meaningful or just an artifact of the loss function?"*
 
 | Method | Edge Precision | Edge Recall | F1 (Graph) | Accuracy |
-| ------ | -------------- | ----------- | ----------- | -------- |
-| FSAKE  | —              | —           | —           | baseline |
-| Ours   | xx.x           | xx.x        | xx.x        | +Δ       |
+| ------ | -------------- | ----------- | ---------- | -------- |
+| FSAKE  | —              | —           | —          | baseline |
+| Ours   | xx.x           | xx.x        | xx.x       | +Δ       |
 
 ---
 
@@ -268,30 +316,36 @@ This proves that your environment is fair, you faithfully reproduced the baselin
 ## 5. Detailed Ablation Plan
 
 ### 5.1 Group A: Topology Dynamics
-**Goal**: Show that dynamic graph improves over static k-NN.
+**Goal**: Show that dynamic graph improves over static k-NN, and that Case 2 (edge-vector update) outperforms Case 1 (node aggregation). Also, explicitly isolate the contribution of edge-driven design against the original FSAKE components (Knowledge Filtering, KF and Knowledge Correction, KC).
 
-| Variant             | Static k-NN | Dynamic Rewiring | Edge→Node | Edge Loss |
-| ------------------- | ----------- | ---------------- | --------- | --------- |
-| A1 Baseline (FSAKE) | ✅           | ❌                | ❌         | ❌         |
-| A2                  | ❌           | ✅                | ❌         | ❌         |
-| A3                  | ❌           | ✅                | ✅         | ❌         |
-| A4 Full             | ❌           | ✅                | ✅         | ✅         |
+| Variant            | Static k-NN | Dynamic Rewiring | Node update                      | Edge Loss / KC  | Knowledge Filtering (KF) |
+| ------------------ | ----------- | ---------------- | -------------------------------- | --------------- | ------------------------ |
+| A1 Baseline (HGNN) | ✅           | ❌                | $A X W$ (node agg.)              | ❌               | ❌                        |
+| A2 FSAKE (KF + KC) | ✅           | ❌                | $A X W$ (node agg.)              | KC (Node-level) | ✅                        |
+| A3                 | ❌           | ✅                | $A' X W$ (simple MP)             | ❌               | ❌                        |
+| A4                 | ❌           | ✅                | Case 1: $\sigma(g(E)) \cdot A'H$ | ❌               | ✅                        |
+| A5                 | ❌           | ✅                | **Case 2**: $A_{edge} E W'$      | ❌               | ✅                        |
+| A6 Full            | ❌           | ✅                | **Case 2**: $A_{edge} E W'$      | Edge Loss (New) | ✅                        |
 
 *What this proves*:
-* `A2 − A1` → effect of dynamic topology
-* `A3 − A2` → effect of edge-to-node projection
-* `A4 − A3` → effect of edge-level supervision
+* `A2 − A1` → effect of original FSAKE components (KF + KC) over raw HGNN
+* `A3 − A1` → effect of dynamic topology alone
+* `A4 − A3` → effect of edge-feature gating on node aggregation (Case 1)
+* `A5 − A4` → effect of the true edge-to-node projection (Case 2 — the stronger novelty)
+* `A6 − A2` → direct comparison showing that dynamic edge topology + edge loss outperforms static k-NN + node-level KC
 
-### 5.2 Group B: Variable Degree Analysis
-Compare the effect of allowing a variable/dynamic degree instead of fixed k.
+Code flags: `use_edge_proj`, `use_case2`, `use_lmt` in `DEKAEModel` map directly to each variant.
 
-| Variant | Degree                   |
-| ------- | ------------------------ |
-| B1      | Fixed k = 5              |
-| B2      | Fixed k = 10             |
-| B3      | Dynamic (learned degree) |
+### 5.2 Group B: Variable Degree Analysis & Selection Strategy
+Compare the effect of allowing a variable/dynamic degree instead of fixed k, and evaluate node selection strategies (e.g., max vs. nearest-to-centroid) which the FSAKE article noted behaves differently across 1-shot (max works better) and 5-shot (nearest works better).
 
-*Measure*: Average degree, Degree variance, and Accuracy. This proves the **adaptivity** of your topology.
+| Variant | Degree Constraints       | Selection Strategy           |
+| ------- | ------------------------ | ---------------------------- |
+| B1      | Fixed k = 5              | Max (top-k absolute scores)  |
+| B2      | Fixed k = 5              | Nearest (to class centroid)  |
+| B3      | Dynamic (learned degree) | Auto-adaptive (soft weights) |
+
+*Measure*: Average degree, Degree variance, and Accuracy across 1-shot and 5-shot settings. This proves the **adaptivity** of your topology and whether the learned degree naturally mitigates the need to manually toggle between "max" and "nearest" strategies.
 
 ### 5.3 Group C: Edge Feature Importance
 Test if richer edge modeling is actually needed.
@@ -311,12 +365,12 @@ Because dynamic graphs can be unstable, run **3–5 random seeds** and report th
 ### 5.5 Group E: Regularization & Sparsity
 **Goal**: Demonstrate that sparsity constraints prevent graph collapse and actually improve performance. This directly responds to the graph collapse risk (Section 1.5, Risk 1).
 
-| Variant | Sparsity Reg | Graph Density | Accuracy |
-| ------- | ------------ | ------------- | -------- |
-| E1      | None         | (report)      | (report) |
-| E2      | L1 on $A'$   | (report)      | (report) |
-| E3      | Top-k hard mask | (report)   | (report) |
-| E4      | Laplacian smoothness | (report) | (report) |
+| Variant | Sparsity Reg         | Graph Density | Accuracy |
+| ------- | -------------------- | ------------- | -------- |
+| E1      | None                 | (report)      | (report) |
+| E2      | L1 on $A'$           | (report)      | (report) |
+| E3      | Top-k hard mask      | (report)      | (report) |
+| E4      | Laplacian smoothness | (report)      | (report) |
 
 *What this proves*:
 * `E1` demonstrates the collapse baseline — an unconstrained model may learn overly dense graphs and perform worse.
@@ -326,11 +380,11 @@ Because dynamic graphs can be unstable, run **3–5 random seeds** and report th
 ### 5.6 Group F: Overparameterization Robustness
 Test sensitivity to edge MLP capacity, particularly in the 1-shot setting where episodes have only 5–25 nodes.
 
-| Variant | Edge MLP Structure           | 1-shot Acc | 5-shot Acc |
-| ------- | ---------------------------- | ---------- | ---------- |
-| F1      | Full MLP (256-hidden)        | (report)   | (report)   |
-| F2      | Low-rank (rank-16 bilinear)  | (report)   | (report)   |
-| F3      | Simple dot-product scoring   | (report)   | (report)   |
+| Variant | Edge MLP Structure          | 1-shot Acc | 5-shot Acc |
+| ------- | --------------------------- | ---------- | ---------- |
+| F1      | Full MLP (256-hidden)       | (report)   | (report)   |
+| F2      | Low-rank (rank-16 bilinear) | (report)   | (report)   |
+| F3      | Simple dot-product scoring  | (report)   | (report)   |
 
 *Expected outcome*: In the 1-shot setting, simpler/lower-capacity edge parameterizations may outperform large MLPs due to the extremely small effective sample size per episode.
 
@@ -341,45 +395,117 @@ Test sensitivity to edge MLP capacity, particularly in the 1-shot setting where 
 Using the planted-partition setup from Section 2.3, vary the noise level $\sigma$ systematically and report how Graph F1 and accuracy degrade.
 
 | Noise Level $\sigma$ | FSAKE (Graph F1) | Ours (Graph F1) | FSAKE Acc | Ours Acc |
-| --- | --- | --- | --- | --- |
-| Low (0.3) | (report) | (report) | (report) | (report) |
-| Medium (0.6) | (report) | (report) | (report) | (report) |
-| High (0.8) | (report) | (report) | (report) | (report) |
-| Very High (1.0) | (report) | (report) | (report) | (report) |
+| -------------------- | ---------------- | --------------- | --------- | -------- |
+| Low (0.3)            | (report)         | (report)        | (report)  | (report) |
+| Medium (0.6)         | (report)         | (report)        | (report)  | (report) |
+| High (0.8)           | (report)         | (report)        | (report)  | (report) |
+| Very High (1.0)      | (report)         | (report)        | (report)  | (report) |
 
 *What this proves*: Your method maintains a larger margin over FSAKE as noise increases, validating that supervised edge rewiring is specifically beneficial when the signal is weak — directly justifying the contribution in hard cases.
 
 #### G2: N-way / K-shot Configuration Sensitivity
 Vary the episode configuration to confirm the method is not tuned to a single protocol.
 
-| Config | FSAKE Acc | Ours Acc | Δ |
-| --- | --- | --- | --- |
-| 5-way 1-shot | (report) | (report) | (report) |
-| 5-way 5-shot | (report) | (report) | (report) |
-| 10-way 1-shot | (report) | (report) | (report) |
-| 10-way 5-shot | (report) | (report) | (report) |
+| Config        | FSAKE Acc | Ours Acc | Δ        |
+| ------------- | --------- | -------- | -------- |
+| 5-way 1-shot  | (report)  | (report) | (report) |
+| 5-way 5-shot  | (report)  | (report) | (report) |
+| 10-way 1-shot | (report)  | (report) | (report) |
+| 10-way 5-shot | (report)  | (report) | (report) |
 
 *Expected pattern*: Gains should be largest in 1-shot (fewer labels → more benefit from relational structure) and should hold in 10-way (more classes → more complex topology, which the dynamic method handles better than fixed k-NN).
 
 #### G3: Backbone Sensitivity
 Run with at least two backbones (Conv4 and ResNet-12 if feasible) to confirm the gain is not backbone-specific. If only one backbone is available, acknowledge this as a limitation and suggest it as future work.
 
-| Backbone | FSAKE Acc | Ours Acc | Δ |
-| --- | --- | --- | --- |
-| Conv4 (64-dim) | (report) | (report) | (report) |
-| Conv4 (128-dim) | (report) | (report) | (report) |
-| ResNet-12 (if feasible) | (report) | (report) | (report) |
+| Backbone                | FSAKE Acc | Ours Acc | Δ        |
+| ----------------------- | --------- | -------- | -------- |
+| Conv4 (64-dim)          | (report)  | (report) | (report) |
+| Conv4 (128-dim)         | (report)  | (report) | (report) |
+| ResNet-12 (if feasible) | (report)  | (report) | (report) |
 
-#### G4: Edge Loss Weight Sensitivity ($\lambda_{edge}$)
+#### G4: Dataset Resolution Sensitivity (e.g., CIFAR-FS)
+**Observation from FSAKE**: On CIFAR-FS (low-resolution 32x32 images), FSAKE's 5-shot accuracy slightly trailed HGNN (85.92 vs. 86.16), because low resolution introduces "false neighbor information" in static k-NN graphs.
+**Goal**: Show that dynamic topology is especially beneficial here, learning to ignore spurious similarities.
+
+| Dataset      | Resolution | Baseline HGNN (5-shot) | FSAKE (5-shot) | Ours (5-shot) |
+| ------------ | ---------- | ---------------------- | -------------- | ------------- |
+| miniImageNet | 84x84      | (report)               | 79.66          | (report)      |
+| CIFAR-FS     | 32x32      | 86.16                  | 85.92          | (report)      |
+
+*What this proves*: Dynamic rewiring mitigates the "false neighbor" problem on low-resolution datasets by adapting to feature spaces where distance is less reliable.
+
+### 5.8 Group H: Latent Mediator Transformer Ablation
+**Goal**: Isolate the contribution of the LMT and validate its design choices.
+
+#### H1: LMT vs. No-LMT
+| Variant | LMT                       | 1-shot Acc | 5-shot Acc |
+| ------- | ------------------------- | ---------- | ---------- |
+| H1a     | No-LMT (prototype cosine) | (report)   | (report)   |
+| H1b     | With LMT (full model)     | (report)   | (report)   |
+
+*What this proves*: `H1b − H1a` isolates the contribution of cross-set mediator refinement over raw prototype cosine similarity.
+
+#### H2: Number of Mediator Tokens ($m$)
+| $m$   | Complexity reduction | 1-shot Acc |
+| ----- | -------------------- | ---------- |
+| 2     | High compression     | (report)   |
+| 8     | Balanced (default)   | (report)   |
+| 16    | Low compression      | (report)   |
+| $N_s$ | Equivalent to direct | (report)   |
+
+*Expected pattern*: A moderate $m$ (8–16) should perform best; $m=N_s$ collapses to near-direct attention without the compression benefit.
+
+#### H3: LMT Depth ($L_{lmt}$)
+| $L_{lmt}$ | 1-shot Acc | Params added |
+| --------- | ---------- | ------------ |
+| 1 layer   | (report)   | (report)     |
+| 3 layers  | (report)   | (report)     |
+| 5 layers  | (report)   | (report)     |
+
+*What this proves*: Iterative refinement (3 layers) outperforms single-shot exchange (1 layer), justifying the multi-cycle design.
+
+#### H4: Mediator Initialization Strategy
+| Init strategy              | 1-shot Acc |
+| -------------------------- | ---------- |
+| Learned (default)          | (report)   |
+| Random fixed (no gradient) | (report)   |
+| Zero-initialized           | (report)   |
+
+*What this proves*: The learnable mediator tokens accumulate meta-knowledge across episodes (episodic meta-prior), not just acting as random projection keys.
+
+#### H5: LMT Phase Ablation
+| Variant    | Gather | Distribute | 1-shot Acc |
+| ---------- | ------ | ---------- | ---------- |
+| H5a        | ✅      | ❌          | (report)   |
+| H5b        | ❌      | ✅          | (report)   |
+| H5c (full) | ✅      | ✅          | (report)   |
+
+*What this proves*: Both phases are necessary; gather alone (compressing context without redistribution) or distribute alone (without first aggregating) each degrade performance.
+
+### 5.9 Group I: Multi-Level Edge Supervision
+**Goal**: The FSAKE article suggested that applying correction loss on multiple layers (not just the penultimate) could be future work. This ablation tests applying edge-level loss at multiple GNN layers.
+
+| Variant | Edge Loss Placement               | 1-shot Acc | 5-shot Acc |
+| ------- | --------------------------------- | ---------- | ---------- |
+| I1      | Penultimate GNN layer only        | (report)   | (report)   |
+| I2      | All GNN layers (equally weighted) | (report)   | (report)   |
+| I3      | All GNN layers (decaying weight)  | (report)   | (report)   |
+
+*What this proves*: Whether multi-level edge supervision provides richer gradient signals for topology refinement across all layers, provided it does not cause training instability.
+
+---
+
+#### G5: Edge Loss Weight Sensitivity ($\lambda_{edge}$)
 Test that the model is not sensitive to the specific choice of the edge loss weighting hyperparameter.
 
-| $\lambda_{edge}$ | Accuracy | Graph F1 |
-| --- | --- | --- |
+| $\lambda_{edge}$   | Accuracy | Graph F1 |
+| ------------------ | -------- | -------- |
 | 0.0 (no edge loss) | (report) | (report) |
-| 0.1 | (report) | (report) |
-| 0.5 | (report) | (report) |
-| 1.0 | (report) | (report) |
-| 2.0 | (report) | (report) |
+| 0.1                | (report) | (report) |
+| 0.5                | (report) | (report) |
+| 1.0                | (report) | (report) |
+| 2.0                | (report) | (report) |
 
 *What this proves*: Accuracy should be relatively stable across a reasonable range (e.g., 0.1–1.0) and drop sharply at 0.0 and at very high values. A flat plateau region confirms the design is robust to hyperparameter choice, not requiring careful tuning to claim gains.
 
@@ -416,20 +542,24 @@ Beyond CI, run a **Paired t-test** between FSAKE and Your Method across test epi
 Report the p-value; proving $p < 0.05$ will give you a significant edge in few-shot publications.
 
 ### 6.4 Complexity Reporting
-Create a table isolating performance versus cost. Example:
+Create a table isolating performance versus cost. It is essential to prove that the dynamic topology adds value beyond mere capacity increase, especially since FSAKE achieved improvements with moderate parameters.
 
-| Model | Params (M) | FLOPs (M) | Time/Epoch (s) |
-| ----- | ---------- | --------- | -------------- |
-| FSAKE | 1.2        | 320       | 18             |
-| Ours  | 1.35       | 360       | 22             |
+| Model        | Accuracy | Params (M) | FLOPs (M) | Time/Epoch (s) |
+| ------------ | -------- | ---------- | --------- | -------------- |
+| HGNN         | (report) | (report)   | (report)  | (report)       |
+| FSAKE (base) | 79.66    | 1.2        | 320       | 18             |
+| Ours         | (report) | 1.35       | 360       | 22             |
+
+Ensure any accuracy gain is accompanied by a reasonable cost increase.
 
 ### 6.5 Visualization Plan
-Generate these plots to make a visually convincing argument:
+Generate these plots to make a visually convincing argument. Leverage the FSAKE article's visualization style to contrast results directly:
 1. **Graph visualization per layer** (Topology map)
 2. **Degree distribution histogram**
 3. **Accuracy vs. degree curve**
 4. **Graph Density curve** over training epochs (demonstrate sparsity stabilization, not collapse)
-5. **t-SNE** feature projection (before/after dynamic topology mapping)
+5. **t-SNE feature projection**: Show embeddings before/after dynamic topology mapping. Contrast these side-by-side with FSAKE's t-SNE plots to highlight improved intra-class compactness and inter-class separation.
+6. **Learned Adjacency Heatmaps**: Visually demonstrate how the dynamic topology adapts edges compared to a static k-NN matrix.
 
 ---
 
@@ -452,8 +582,9 @@ Generate these plots to make a visually convincing argument:
     * Dynamic Edge Feature Learning
     * Adaptive Topology Reconstruction & Message Passing (with sparsity constraints)
     * Knowledge Filtering with Edge Awareness
-    * Supervised Edge Loss (support–support only — justify label leakage prevention)
+    * Supervised Edge Loss (support–support only): Explicitly reinforce that to prevent label-leakage, edge loss is only applied to support-support pairs, similar to how FSAKE applied correction loss only to the penultimate layer.
     * Regularization & Stability Constraints (L1 + Laplacian for variable-degree; top-k only in ablation)
+    * **Latent Mediator Transformer** (cross-set refinement — §1.7): position as a post-GNN module that refines both $H_Q$ and $H_S$ through a complexity-efficient bottleneck before prototype classification. Justify complexity advantage and differentiate from Perceiver IO and direct cross-attention.
 4. **Theoretical Analysis** — *must include at minimum*:
     * **Proposition 1 (Expressivity)**: *The set of graphs representable by our dynamic rewiring strictly contains the set of static k-NN graphs as a strict special case.* Proof sketch: if the edge scoring function $f(h_i, h_j) = -\|h_i - h_j\|_2$ (negative Euclidean distance) and the resulting scores are followed by a hard top-$k$ mask, the learned topology exactly recovers static $k$-NN from feature space. Because our hypothesis class allows any learnable $f$ beyond this distance function — including asymmetric bilinear forms, MLP scorers, and soft rather than hard thresholds — static $k$-NN is a strict subset of our model family. This makes the proposition airtight: it is not merely that we generalize distance-based construction, but that we make the *hard top-k on Euclidean distance* recoverable as a degenerate configuration.
     * **Proposition 2 (Complexity)**: $O(N^2 d)$ per layer, matching Transformer self-attention — no asymptotic overhead.
