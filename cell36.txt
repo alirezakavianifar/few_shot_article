@@ -1,0 +1,297 @@
+# ── Section 15: Ablation Study Runner ────────────────────────────────────────
+import copy
+
+# ── Base config (derived from CFG) ───────────────────────────────────────────
+# IMPORTANT: extended from 30→100 epochs and 100→300 ep/epoch so ablation
+# results are comparable to the full training run (30 epochs was too short
+# to rank variants reliably — all differences were within CI).
+BASE = copy.deepcopy(CFG)
+BASE["n_epochs"]          = 100
+BASE["n_episodes_train"]  = 300
+BASE["n_eval_episodes"]   = 200
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Group A: Topology Dynamics  (plan §5.1)
+#
+# Ablation table (matches plan §5.1):
+#   A0 — ProtoNet anchor (no GNN)
+#   A1 — FSAKE: static k-NN, node aggregation A'H (Case 1, use_case2=False)
+#   A2 — dynamic rewiring only (no edge-to-node proj)
+#   A3 — dynamic + Case 1 node update (X' = σ(g(E))·A'H)   [plan A4]
+#   A4 — dynamic + Case 2 node update (X' = A_edge@E@W')   [plan A5]
+#   A5 — dynamic + Case 2 + edge loss (full, no LMT)        [plan A6]
+#
+# NOTE: All Group A variants use use_lmt=False so the GNN contribution is
+# isolated.  Group H tests the LMT module independently (H1a vs H1b).
+#
+# NOTE on A2 vs A3 distinction (bug fixed from prior run):
+#   A2 = dynamic rewiring only → use_edge_proj=False (simple A'H message passing)
+#   A3 = dynamic + Case 1 edge-gated node agg → use_edge_proj=True, use_case2=False
+#   Previously A2 and A3 had identical configs. Now correctly separated.
+# ──────────────────────────────────────────────────────────────────────────────
+ABLATION_CONFIGS = {
+
+    # A0 — ProtoNet anchor: no GNN at all (pure prototype matching on backbone)
+    # use_dynamic=False, use_edge_proj=False → A_init @ H only (1 MP pass)
+    "A0_ProtoNet": {**BASE,
+        "use_dynamic": False, "use_edge_proj": False,
+        "use_case2": False, "use_lmt": False,
+        "lambda_edge": 0.0, "sparsity_mode": "none"},
+
+    # A1 — FSAKE baseline (static k-NN, Case 1 node aggregation, no edge loss)
+    # use_case2=False: node update is edge-gated aggregation of neighbour features
+    # FSAKE uses node-level correction — here reproduced as static graph + edge KF
+    "A1_FSAKE": {**BASE,
+        "use_dynamic": False, "use_edge_proj": True,
+        "use_case2": False,   "use_lmt": False,
+        "lambda_edge": 0.0, "sparsity_mode": "none"},
+
+    # A2 — Dynamic rewiring only (no edge-to-node projection, no edge loss)
+    "A2_dyn_only": {**BASE,
+        "use_dynamic": True, "use_edge_proj": False,
+        "use_case2": True,   "use_lmt": False,   # use_case2 irrelevant when use_edge_proj=False
+        "lambda_edge": 0.0},
+
+    # A3 — Dynamic + Case 1: X' = σ(g(E)) · A' @ H  (edge-gated node aggregation)
+    # [plan §5.1 A4]  isolates the benefit of edge-gated vs. plain message passing
+    "A3_case1": {**BASE,
+        "use_dynamic": True, "use_edge_proj": True,
+        "use_case2": False,  "use_lmt": False,
+        "lambda_edge": 0.0},
+
+    # A4 — Dynamic + Case 2: X' = A_edge @ E @ W'  (edge-vector node update)
+    # [plan §5.1 A5]  the stronger novelty — nodes updated from edge vectors
+    "A4_case2": {**BASE,
+        "use_dynamic": True, "use_edge_proj": True,
+        "use_case2": True,   "use_lmt": False,
+        "lambda_edge": 0.0},
+
+    # A5 — Full DEKAE model (dynamic + Case 2 + supervised edge loss, no LMT)
+    # [plan §5.1 A6]  direct comparison: shows edge loss adds value beyond Case 2
+    "A5_DEKAE_noLMT": {**BASE,
+        "use_dynamic": True, "use_edge_proj": True,
+        "use_case2": True,   "use_lmt": False,
+        "lambda_edge": 0.5},
+
+    # A6 — Full DEKAE with LMT (complete proposed model)
+    # [Group H anchor] — break-even comparison against A5 to isolate LMT gain
+    "A6_DEKAE_full": {**BASE,
+        "use_dynamic": True, "use_edge_proj": True,
+        "use_case2": True,   "use_lmt": True,
+        "lambda_edge": 0.5},
+
+    # ── Group B: Variable Degree ──────────────────────────────────────────────
+    "B1_fixed_k5":  {**BASE, "use_dynamic": False, "use_lmt": False,
+                     "topk_k": 5,  "lambda_edge": 0.0},
+    "B2_fixed_k10": {**BASE, "use_dynamic": False, "use_lmt": False,
+                     "topk_k": 10, "lambda_edge": 0.0},
+    "B3_dynamic":   {**BASE, "use_dynamic": True,  "use_lmt": False,
+                     "lambda_edge": 0.5},
+
+    # ── Group C: Edge Feature Projection Type (plan §5.3) ────────────────────
+    # Goal: isolate the contribution of learned edge features vs. raw adjacency.
+    #
+    # C1 — No edge features: EdgeIncidenceModule returns zeros.
+    #       DynamicTopologyModule uses bilinear node scores only.
+    #       EdgeToNodeProjection receives zero vectors → degenerates to A'H MP.
+    #       This is the "just adjacency" baseline from the plan.
+    #
+    # C2 — Linear projection: E = W·[h_i||h_j], single linear layer, no ReLU.
+    #       Tests whether a non-linear MLP is needed, or if linear suffices.
+    #
+    # C3 — MLP projection: 2-layer MLP with ReLU (current default architecture).
+    #       Should outperform C1 and C2 — validates that non-linear edge features
+    #       are worth the extra parameters.
+    #
+    # All C variants use: use_case2=True, use_dynamic=True, use_lmt=False
+    # (LMT is off so the GNN edge-feature contribution is cleanly isolated).
+    # The default lambda_edge=0.5 is kept so the edge correction loss engages.
+    #
+    # Expected ordering: C3 (MLP) ≥ C2 (linear) > C1 (none)
+    # If C2 ≈ C3: linear projection suffices, MLP doesn't add value (report this)
+    # If C1 ≈ C2: learned projection itself is not the bottleneck (review arch)
+    "C1_no_edge_feat":  {**BASE,
+        "use_dynamic": True, "use_edge_proj": True,
+        "use_case2": True,   "use_lmt": False,
+        "lambda_edge": 0.5,  "edge_proj_type": "none"},
+
+    "C2_linear_proj":   {**BASE,
+        "use_dynamic": True, "use_edge_proj": True,
+        "use_case2": True,   "use_lmt": False,
+        "lambda_edge": 0.5,  "edge_proj_type": "linear"},
+
+    "C3_mlp_proj":      {**BASE,
+        "use_dynamic": True, "use_edge_proj": True,
+        "use_case2": True,   "use_lmt": False,
+        "lambda_edge": 0.5,  "edge_proj_type": "mlp"},    # same as A4_case2 — sanity anchor
+
+    # ── Group E: Sparsity ─────────────────────────────────────────────────────
+    # ⚠ WARNING: E4_laplacian is retained for completeness but empirically
+    # collapsed to ~26% accuracy (near random chance) in initial runs.
+    # Laplacian smoothness harmonises adjacent node representations — in a
+    # mixed-class few-shot episode this destroys class discriminability.
+    # Do NOT use as the primary model — include only as a negative ablation.
+    "E1_no_sparse":   {**BASE, "sparsity_mode": "none",    "use_lmt": False},
+    "E2_l1":          {**BASE, "sparsity_mode": "l1",      "use_lmt": False},
+    "E3_topk":        {**BASE, "sparsity_mode": "topk",    "use_lmt": False},
+    "E4_laplacian":   {**BASE, "sparsity_mode": "laplacian","use_lmt": False},  # ⚠ known-harmful
+
+    # ── Group F: Edge MLP Capacity ────────────────────────────────────────────
+    "F1_full_rank64": {**BASE, "rank": 64,  "use_lmt": False},
+    "F2_lowrank16":   {**BASE, "rank": 16,  "use_lmt": False},
+    "F3_dotprod1":    {**BASE, "rank": 1,   "use_lmt": False},
+
+    # ── Group D: Seed Stability (plan §5.4) ──────────────────────────────────────
+    # Run the full DEKAE model (= A5_DEKAE_noLMT config) with 5 different random
+    # seeds.  Each variant is identical in all hyperparameters — only the seed
+    # changes.  Collect per-seed test accuracy and topology stats; report mean±std
+    # and 95% CI across seeds.
+    #
+    # Low std across seeds → training is stable and reproducible.
+    # High std → dynamic adjacency is sensitive to initialization (see Risk 4/8).
+    #
+    # run_seed_stability() (defined in Section 15d) is the recommended runner;
+    # these config entries also allow individual seeds via run_ablation() if needed.
+    #
+    # Seeds chosen: 42(default), 0, 1, 7, 123  — spread across the low-integer
+    # range which is standard in FSL reproducibility ablations.
+    "D_seed42":  {**BASE, "use_dynamic": True, "use_edge_proj": True,
+                  "use_case2": True, "use_lmt": False, "lambda_edge": 0.5,
+                  "seed": 42},
+    "D_seed0":   {**BASE, "use_dynamic": True, "use_edge_proj": True,
+                  "use_case2": True, "use_lmt": False, "lambda_edge": 0.5,
+                  "seed": 0},
+    "D_seed1":   {**BASE, "use_dynamic": True, "use_edge_proj": True,
+                  "use_case2": True, "use_lmt": False, "lambda_edge": 0.5,
+                  "seed": 1},
+    "D_seed7":   {**BASE, "use_dynamic": True, "use_edge_proj": True,
+                  "use_case2": True, "use_lmt": False, "lambda_edge": 0.5,
+                  "seed": 7},
+    "D_seed123": {**BASE, "use_dynamic": True, "use_edge_proj": True,
+                  "use_case2": True, "use_lmt": False, "lambda_edge": 0.5,
+                  "seed": 123},
+
+    # ── Group G5: Lambda_edge Sensitivity (plan §5.7 G5) ─────────────────────────
+    # NOTE: Implementation names kept as G4 for continuity, but these correspond
+    # to plan §5.7 G5 (Edge Loss Weight Sensitivity).
+    "G5_lam0":   {**BASE, "lambda_edge": 0.0, "use_lmt": False},
+    "G5_lam01":  {**BASE, "lambda_edge": 0.1, "use_lmt": False},
+    "G5_lam05":  {**BASE, "lambda_edge": 0.5, "use_lmt": False},
+    "G5_lam1":   {**BASE, "lambda_edge": 1.0, "use_lmt": False},
+    "G5_lam2":   {**BASE, "lambda_edge": 2.0, "use_lmt": False},
+
+    # ── Group H: Latent Mediator Transformer Ablation (plan §5.8) ────────────
+    #
+    # H1: With vs. Without LMT (use A5_DEKAE_noLMT vs A6_DEKAE_full above)
+    #
+    # H2: Number of mediator tokens m (plan §5.8 H2)
+    # Expected: moderate m=8-16 best; m=N_s collapses to near-direct attention
+    "H2_m2":     {**BASE, "use_lmt": True, "n_mediators": 2,   "lambda_edge": 0.5},
+    "H2_m8":     {**BASE, "use_lmt": True, "n_mediators": 8,   "lambda_edge": 0.5},  # default
+    "H2_m16":    {**BASE, "use_lmt": True, "n_mediators": 16,  "lambda_edge": 0.5},
+    "H2_m32":    {**BASE, "use_lmt": True, "n_mediators": 32,  "lambda_edge": 0.5},  # ≈N_s (5-shot)
+
+    # H3: LMT depth — number of gather-distribute cycles (plan §5.8 H3)
+    # Expected: 3 layers > 1 layer (iterative refinement adds value)
+    "H3_L1":     {**BASE, "use_lmt": True, "lmt_layers": 1, "lambda_edge": 0.5},
+    "H3_L3":     {**BASE, "use_lmt": True, "lmt_layers": 3, "lambda_edge": 0.5},  # default
+    "H3_L5":     {**BASE, "use_lmt": True, "lmt_layers": 5, "lambda_edge": 0.5},
+
+    # ── Group H4: Mediator Initialisation Strategy (plan §5.8 H4) ─────────────
+    # Tests whether learned mediator tokens contribute vs. fixed/zero baselines.
+    # Expected: 'learned' > 'fixed' > 'zero' (meta-prior in M is beneficial)
+    "H4_learned": {**BASE, "use_lmt": True, "lmt_init_strategy": "learned",
+                   "lambda_edge": 0.5},                              # default
+    "H4_fixed":   {**BASE, "use_lmt": True, "lmt_init_strategy": "fixed",
+                   "lambda_edge": 0.5},                              # random, no grad
+    "H4_zero":    {**BASE, "use_lmt": True, "lmt_init_strategy": "zero",
+                   "lambda_edge": 0.5},                              # zeros init, no grad
+
+    # ── Group H5: LMT Phase Ablation (plan §5.8 H5) ───────────────────────────
+    # Tests whether the gather phase, distribute phase, or both are necessary.
+    # Expected: 'both' >> 'gather_only' ≈ 'distribute_only'
+    "H5a_gather_only":     {**BASE, "use_lmt": True, "lmt_phases": "gather_only",
+                             "lambda_edge": 0.5},  # mediator updated, not broadcast back
+    "H5b_distribute_only": {**BASE, "use_lmt": True, "lmt_phases": "distribute_only",
+                             "lambda_edge": 0.5},  # broadcast from init M, no gather
+    "H5c_both":            {**BASE, "use_lmt": True, "lmt_phases": "both",
+                             "lambda_edge": 0.5},  # full gather + distribute (default)
+
+    # ── Group I: Multi-Level Edge Supervision (plan §5.9) ─────────────────────
+    # Tests where in the GNN stack to apply the edge correction loss.
+    # I1 — penultimate only: edge loss applied only at the final GNN layer
+    # I2 — all layers equal: edge loss at every layer with equal weight (current default)
+    # I3 — all layers decaying: edge loss at all layers, weight = 1/(L-l)
+    #       (higher weight at later layers, tapering toward earlier ones)
+    # Expected: I2 ≈ I3 > I1 (multi‑layer supervision beneficial)
+    "I1_penultimate":  {**BASE, "use_lmt": True, "edge_loss_mode": "penultimate",
+                        "lambda_edge": 0.5},
+    "I2_all_equal":    {**BASE, "use_lmt": True, "edge_loss_mode": "all",
+                        "lambda_edge": 0.5},     # default behaviour
+    "I3_all_decaying": {**BASE, "use_lmt": True, "edge_loss_mode": "decaying",
+                        "lambda_edge": 0.5},
+}
+
+
+def run_ablation(name: str, cfg: dict, episode_fn_train, episode_fn_val,
+                 log_wandb: bool = False):
+    """
+    Train and evaluate a single ablation variant.
+    Applies ALL ablation flags from cfg (use_dynamic, use_edge_proj,
+    use_case2, use_lmt) so ABLATION_CONFIGS fully controls the model.
+    Returns a summary dict with name, mean_acc, ci_95.
+    """
+    print(f"\n{'='*60}")
+    print(f"Running ablation: {name}")
+    print(f"{'='*60}")
+    set_seed(cfg.get("seed", 42))
+
+    model = build_model(cfg)
+    # Apply all ablation toggle flags from config after build
+    # (build_model already passes them; these calls are an explicit safety guard)
+    model.set_use_dynamic(cfg.get("use_dynamic", True))
+    model.set_use_edge_proj(cfg.get("use_edge_proj", True))
+    model.set_use_case2(cfg.get("use_case2", True))     # plan §5.1: Case 1 vs Case 2
+    model.set_use_lmt(cfg.get("use_lmt", True))         # plan §5.8: Group H ablation
+
+    trained_model, history = train(
+        cfg, episode_fn_train, episode_fn_val,
+        run_name=name, log_wandb=log_wandb
+    )
+
+    # Evaluate
+    res = evaluate(trained_model, episode_fn_val,
+                   cfg["n_way"], cfg["k_shot"], cfg["n_query"],
+                   n_episodes=cfg.get("n_eval_episodes", 200))
+    res["name"] = name
+    print(f"→ {name}: {res['mean_acc']*100:.2f} ± {res['ci_95']*100:.2f}%")
+    return res
+
+
+def run_all_ablations(groups: list, episode_fn_train, episode_fn_val):
+    """Run a subset of ablation groups and collect results."""
+    results = []
+    for name in groups:
+        if name not in ABLATION_CONFIGS:
+            print(f"⚠ Unknown ablation key: {name}")
+            continue
+        res = run_ablation(name, ABLATION_CONFIGS[name],
+                           episode_fn_train, episode_fn_val)
+        results.append(res)
+    return results
+
+
+print("Ablation configs defined.")
+print("Group A variants :", [k for k in ABLATION_CONFIGS if k.startswith("A")])
+print("Group C variants :", [k for k in ABLATION_CONFIGS if k.startswith("C")])
+print("Group D variants :", [k for k in ABLATION_CONFIGS if k.startswith("D")])
+print("Group E variants :", [k for k in ABLATION_CONFIGS if k.startswith("E")])
+print("Group H variants :", [k for k in ABLATION_CONFIGS if k.startswith("H")])
+print("Group H4 variants:", [k for k in ABLATION_CONFIGS if k.startswith("H4")])
+print("Group H5 variants:", [k for k in ABLATION_CONFIGS if k.startswith("H5")])
+print("Group G5 variants:", [k for k in ABLATION_CONFIGS if k.startswith("G5")])
+print("Group I  variants:", [k for k in ABLATION_CONFIGS if k.startswith("I")])
+print(f"\nBase ablation config: {BASE['n_epochs']} epochs × {BASE['n_episodes_train']} ep/epoch "
+      f"= {BASE['n_epochs'] * BASE['n_episodes_train']:,} episodes total")
+print("\nAll Group A variants have use_lmt=False (LMT tested separately in Group H).")
+print("A3_case1 (Case 1) and A4_case2 (Case 2) now correctly differ by use_case2 flag.")

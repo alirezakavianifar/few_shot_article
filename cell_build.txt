@@ -1,0 +1,248 @@
+import time, json
+from torch.optim import Adam
+from torch.optim.lr_scheduler import CosineAnnealingLR
+from tqdm.notebook import tqdm
+
+# ── Hyperparameters (edit via config dict for ablations) ─────────────────────
+CFG = {
+    "n_way"          : 5,
+    "k_shot"         : 1,
+    "n_query"        : 15,
+    "embed_dim"      : 128,
+    "n_gnn_layers"   : 3,
+    "rank"           : 16,
+    "sparsity_mode"  : "l1",    # 'l1' | 'topk' | 'none'  (laplacian excluded — harmful)
+    "lambda_sparse"  : 0.001,   # lowered from 0.005 → effective 3× lower after /n_gnn_layers fix
+    "lambda_edge"    : 0.5,
+    "topk_k"         : 5,
+    "lr"             : 5e-4,
+    "weight_decay"   : 1e-5,
+    "n_episodes_train": 300,     # episodes per epoch
+    "n_epochs"       : 200,      # extended from 100 — model still improving at ep.100
+    "t_warm"         : 5,        # warm-up epochs with static k-NN
+    "edge_loss_ramp" : 20,       # epochs over which lambda_edge ramps to final
+    "grad_clip"      : 1.0,
+    "eval_every"     : 5,        # validate every N epochs
+    "n_eval_episodes": 200,
+    "seed"           : 42,
+    "use_edge_proj"  : True,     # True=A4/A5, False=A2 (no edge-to-node projection)
+    "use_case2"      : True,     # True=Case 2 X'=A_edge@E@W' (default), False=Case 1
+    "use_lmt"        : True,     # True=Latent Mediator Transformer enabled (default)
+    "use_dynamic"    : True,     # False=static k-NN fallback (ablation A1/A2)
+    "n_mediators"    : 8,        # LMT mediator token count
+    "lmt_layers"     : 3,        # LMT gather-distribute cycles
+    "lmt_heads"      : 4,        # LMT multi-head attention heads
+    "lmt_init_strategy": "learned", # H4: 'learned'|'fixed'|'zero'
+    "lmt_phases"     : "both",   # H5: 'both'|'gather_only'|'distribute_only'
+    "edge_loss_mode" : "all",    # Group I: 'all'(I2)|'penultimate'(I1)|'decaying'(I3)
+}
+
+
+def build_model(cfg: dict) -> DEKAEModel:
+    """
+    Constructs a DEKAEModel from a config dict.
+    All ablation flags (use_case2, use_lmt, use_edge_proj, etc.) are read
+    from cfg so that ABLATION_CONFIGS can fully control the model.
+    """
+    return DEKAEModel(
+        embed_dim     = cfg["embed_dim"],
+        n_gnn_layers  = cfg["n_gnn_layers"],
+        rank          = cfg["rank"],
+        sparsity_mode = cfg["sparsity_mode"],
+        lambda_sparse = cfg["lambda_sparse"],
+        lambda_edge   = cfg["lambda_edge"],
+        topk_k        = cfg["topk_k"],
+        n_way         = cfg["n_way"],
+        use_edge_proj      = cfg.get("use_edge_proj", True),
+        use_case2          = cfg.get("use_case2", True),         # plan §5.1: A4(False) vs A5(True)
+        use_lmt            = cfg.get("use_lmt", True),           # plan §5.8: Group H ablation
+        n_mediators        = cfg.get("n_mediators", 8),
+        lmt_layers         = cfg.get("lmt_layers", 3),
+        lmt_heads          = cfg.get("lmt_heads", 4),
+        lmt_init_strategy  = cfg.get("lmt_init_strategy", "learned"),  # H4 ablation
+        lmt_phases         = cfg.get("lmt_phases", "both"),             # H5 ablation
+        edge_loss_mode     = cfg.get("edge_loss_mode", "all"),          # Group I ablation
+        edge_proj_type     = cfg.get("edge_proj_type", "mlp"),          # Group C ablation
+    ).to(DEVICE)
+
+
+def run_episode(model: DEKAEModel, episode_fn, n_way, k_shot, n_query,
+                lambda_edge_scale: float = 1.0):
+    """
+    Runs one episode through the model and returns
+    (loss, accuracy, metrics_dict).
+    """
+    s_imgs, s_lbl, q_imgs, q_lbl = episode_fn(n_way, k_shot, n_query)
+    s_imgs = s_imgs.to(DEVICE)
+    s_lbl  = s_lbl.to(DEVICE)
+    q_imgs = q_imgs.to(DEVICE)
+    q_lbl  = q_lbl.to(DEVICE)
+
+    logits, aux_loss, metrics = model(s_imgs, s_lbl, q_imgs, lambda_edge_scale)
+
+    cls_loss = F.cross_entropy(logits, q_lbl)
+    total    = cls_loss + aux_loss
+
+    preds   = logits.argmax(dim=1)
+    acc     = (preds == q_lbl).float().mean().item()
+    return total, acc, metrics
+
+
+def train(cfg: dict, episode_fn_train, episode_fn_val,
+          run_name: str = "dekae", log_wandb: bool = False):
+    """
+    Full episodic training loop.
+
+    Scheduler: CosineAnnealingLR (replaces StepLR — smoother LR decay avoids
+    premature learning rate collapse that slowed convergence in early runs).
+
+    episode_fn_train / episode_fn_val : callables (n_way, k_shot, n_query)
+        returning (support_imgs, support_labels, query_imgs, query_labels)
+    """
+    set_seed(cfg["seed"])
+    model      = build_model(cfg)
+    _n_params  = sum(p.numel() for p in model.parameters())
+    print(f"Model parameters: {_n_params:,}")
+    optimizer = Adam(model.parameters(), lr=cfg["lr"],
+                     weight_decay=cfg["weight_decay"])
+    # CosineAnnealingLR: smoothly decays lr from cfg['lr'] to eta_min over all epochs
+    scheduler = CosineAnnealingLR(optimizer, T_max=cfg["n_epochs"], eta_min=1e-6)
+
+    best_val_acc = 0.0
+    history      = []
+
+    for epoch in range(1, cfg["n_epochs"] + 1):
+        t_start = time.time()
+
+        # ── Warm-up: disable dynamic topology for first T_warm epochs ─────────
+        # IMPORTANT: only apply warm-up when cfg["use_dynamic"] is True.
+        # Static-baseline ablations (A1_FSAKE, A0_ProtoNet) set use_dynamic=False
+        # and must NOT have dynamic topology enabled after warm-up.
+        if cfg.get("use_dynamic", True):
+            model.set_use_dynamic(epoch > cfg["t_warm"])
+        # else: keep use_dynamic=False throughout (static baseline ablations)
+
+        # ── Curriculum lambda_edge scaling ────────────────────────────────────
+        ramp_epochs      = cfg["edge_loss_ramp"]
+        lambda_edge_scale = min(1.0, (epoch - cfg["t_warm"]) / max(ramp_epochs, 1))
+        lambda_edge_scale = max(0.0, lambda_edge_scale)
+
+        # ── Training episodes ─────────────────────────────────────────────────
+        model.train()
+        train_losses, train_accs = [], []
+        grad_norms               = []
+        ep_intra_ratios, ep_inter_ratios = [], []
+        ep_densities = []   # for topology_stability (density std across episodes)
+
+        nan_skips = 0
+        pbar = tqdm(range(cfg["n_episodes_train"]),
+                    desc=f"Ep {epoch}/{cfg['n_epochs']}", leave=False)
+        for _ in pbar:
+            optimizer.zero_grad()
+            loss, acc, mets = run_episode(
+                model, episode_fn_train,
+                cfg["n_way"], cfg["k_shot"], cfg["n_query"],
+                lambda_edge_scale
+            )
+
+            # NaN guard: skip poisoned updates (e.g. from collapsed graph)
+            if not torch.isfinite(loss):
+                nan_skips += 1
+                optimizer.zero_grad()
+                continue
+
+            loss.backward()
+
+            # Gradient clipping (Risk 7 mitigation)
+            gnorm = nn.utils.clip_grad_norm_(model.parameters(), cfg["grad_clip"])
+            grad_norms.append(gnorm.item())
+            optimizer.step()
+            train_losses.append(loss.item())
+            train_accs.append(acc)
+            ep_intra_ratios.append(mets.get("intra_edge_ratio", 0))
+            ep_inter_ratios.append(mets.get("inter_edge_ratio", 0))
+            ep_densities.append(mets.get("graph_density", 0))   # topology_stability
+            pbar.set_postfix(loss=f"{loss.item():.3f}", acc=f"{acc:.3f}",
+                             density=f"{mets['graph_density']:.2f}",
+                             intra=f"{mets.get('intra_edge_ratio', 0):.2f}",
+                             nan_skip=nan_skips)
+
+        scheduler.step()
+
+        # ── Validation ────────────────────────────────────────────────────────
+        val_acc_mean = 0.0
+        if epoch % cfg["eval_every"] == 0:
+            model.eval()
+            val_accs = []
+            with torch.no_grad():
+                for _ in range(cfg["n_eval_episodes"]):
+                    _, acc, _ = run_episode(
+                        model, episode_fn_val,
+                        cfg["n_way"], cfg["k_shot"], cfg["n_query"])
+                    val_accs.append(acc)
+            val_acc_mean = float(np.mean(val_accs))
+            val_ci       = 1.96 * float(np.std(val_accs)) / (len(val_accs) ** 0.5)
+
+            # ── Checkpoint best model → Drive ─────────────────────────────────
+            if val_acc_mean > best_val_acc:
+                best_val_acc = val_acc_mean
+                ckpt_path    = CKPT_DIR / f"{run_name}_best.pth"
+                torch.save({
+                    "epoch"   : epoch,
+                    "state"   : model.state_dict(),
+                    "val_acc" : best_val_acc,
+                    "cfg"     : cfg,
+                }, str(ckpt_path))
+                print(f"  ✓ New best val acc = {best_val_acc:.4f}  (ckpt saved)")
+
+        epoch_time = time.time() - t_start
+        topology_stability = float(np.std(ep_densities)) if ep_densities else 0.0
+        log = {
+            "epoch"             : epoch,
+            "train_loss"        : float(np.mean(train_losses)),
+            "train_acc"         : float(np.mean(train_accs)),
+            "val_acc"           : val_acc_mean,
+            "grad_norm_mean"    : float(np.mean(grad_norms)),
+            "lambda_edge_scale" : lambda_edge_scale,
+            "use_dynamic"       : model.use_dynamic,
+            "graph_density"     : mets.get("graph_density", 0),
+            "avg_degree"        : mets.get("avg_degree", 0),
+            "degree_std"        : mets.get("degree_std", 0),      # plan §6.1 & §6.2
+            "topology_stability": topology_stability,              # plan §6.1: density std across episodes
+            "edge_entropy"      : mets.get("edge_entropy", 0),
+            "layer_stability"   : mets.get("layer_stability", []),
+            "intra_edge_ratio"  : float(np.mean(ep_intra_ratios)),
+            "inter_edge_ratio"  : float(np.mean(ep_inter_ratios)),
+            "num_parameters"    : sum(p.numel() for p in model.parameters()),  # plan §6.2
+            "nan_skipped"       : nan_skips,
+            "epoch_time_s"      : epoch_time,
+        }
+        # Density-collapse early warning
+        if log["graph_density"] < 0.01 and model.use_dynamic:
+            print(f"  ⚠ Epoch {epoch}: graph density collapsed to "
+                  f"{log['graph_density']:.4f} — check lambda_sparse / adj_residual")
+        history.append(log)
+
+        # JSON backup to Drive every epoch
+        with open(str(RESULTS_DIR / f"{run_name}_history.json"), "w") as f:
+            json.dump(history, f)
+
+        if log_wandb:
+            import wandb
+            wandb.log(log)
+
+        if epoch % cfg["eval_every"] == 0:
+            print(f"Epoch {epoch:4d} | train_acc={log['train_acc']:.4f} "
+                  f"val_acc={val_acc_mean:.4f}±{val_ci:.4f} "
+                  f"density={log['graph_density']:.3f} "
+                  f"intra={log['intra_edge_ratio']:.3f} "
+                  f"nan_skip={nan_skips} "
+                  f"t={epoch_time:.1f}s")
+            _health_check(log, history, epoch, cfg)
+
+    print(f"\nTraining complete. Best val acc: {best_val_acc:.4f}")
+    return model, history
+
+
+print("Training loop defined. Call train(CFG, ...) to start.")
+print("Model parameter count:", sum(p.numel() for p in build_model(CFG).parameters()))

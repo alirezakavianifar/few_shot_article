@@ -1,0 +1,375 @@
+# ── Section 11: Full Model Assembly (DEKAE) ───────────────────────────────────
+import math
+
+# ── Latent Mediator Transformer (Dependencies) ───────────────────────────────
+# Moved here from Section 11.5 to ensure availability for DEKAEModel.
+
+class LatentMediatorLayer(nn.Module):
+    """
+    Single Latent Mediator Transformer layer.
+    Phase A (Gather): M ← CrossAttn(Q=M, KV=[Q‖S])
+    Phase B (Distribute): Q ← CrossAttn(Q=Q, KV=M), S ← CrossAttn(Q=S, KV=M)
+    """
+    def __init__(self, embed_dim: int, n_heads: int = 4, dropout: float = 0.1,
+                 phases: str = "both"):
+        super().__init__()
+        self.phases = phases
+
+        # Phase A
+        self.gather_attn   = nn.MultiheadAttention(embed_dim, n_heads,
+                                                    dropout=dropout,
+                                                    batch_first=True)
+        self.gather_norm   = nn.LayerNorm(embed_dim)
+        self.gather_ff     = nn.Sequential(
+            nn.Linear(embed_dim, embed_dim * 4),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(embed_dim * 4, embed_dim),
+        )
+        self.gather_ff_norm = nn.LayerNorm(embed_dim)
+
+        # Phase B
+        self.distrib_q_attn = nn.MultiheadAttention(embed_dim, n_heads,
+                                                     dropout=dropout,
+                                                     batch_first=True)
+        self.distrib_q_norm = nn.LayerNorm(embed_dim)
+
+        self.distrib_s_attn = nn.MultiheadAttention(embed_dim, n_heads,
+                                                     dropout=dropout,
+                                                     batch_first=True)
+        self.distrib_s_norm = nn.LayerNorm(embed_dim)
+
+    def forward(self, M, Q, S):
+        # ── Phase A: Gather ───────────────────────────────────────────────────
+        if self.phases in ("both", "gather_only"):
+            context   = torch.cat([Q, S], dim=1)            # (1, N_q+N_s, d)
+            M_a, _    = self.gather_attn(M, context, context)
+            M         = self.gather_norm(M + M_a)
+            M         = self.gather_ff_norm(M + self.gather_ff(M))
+
+        # ── Phase B: Distribute ───────────────────────────────────────────────
+        if self.phases in ("both", "distribute_only"):
+            Q_a, _    = self.distrib_q_attn(Q, M, M)
+            Q         = self.distrib_q_norm(Q + Q_a)
+
+            S_a, _    = self.distrib_s_attn(S, M, M)
+            S         = self.distrib_s_norm(S + S_a)
+
+        return M, Q, S
+
+
+class LatentMediatorTransformer(nn.Module):
+    """
+    Iterative Latent Mediator Transformer for cross-set knowledge exchange.
+    """
+    def __init__(self, embed_dim: int, n_mediators: int = 8,
+                 n_layers: int = 3, n_heads: int = 4, dropout: float = 0.1,
+                 init_strategy: str = "learned", phases: str = "both"):
+        super().__init__()
+        self.embed_dim      = embed_dim
+        self.n_mediators    = n_mediators
+        self.init_strategy  = init_strategy
+        self.phases         = phases
+
+        # ── Mediator token initialization ────────────────────────────────────
+        _m = torch.empty(1, n_mediators, embed_dim)
+        nn.init.trunc_normal_(_m, std=0.02)
+        if init_strategy == "learned":
+            self.mediator_init = nn.Parameter(_m)          # grads ON
+        elif init_strategy == "fixed":
+            self.register_buffer("mediator_init", _m)      # grads OFF
+        elif init_strategy == "zero":
+            self.register_buffer("mediator_init",
+                                 torch.zeros(1, n_mediators, embed_dim))
+        else:
+            raise ValueError(f"Unknown init_strategy: {init_strategy!r}")
+
+        self.layers = nn.ModuleList([
+            LatentMediatorLayer(embed_dim, n_heads, dropout, phases=phases)
+            for _ in range(n_layers)
+        ])
+
+        # Output projections
+        self.q_proj = nn.Linear(embed_dim, embed_dim)
+        self.s_proj = nn.Linear(embed_dim, embed_dim)
+
+    def forward(self, H_query, H_support):
+        Q = H_query.unsqueeze(0)    # (1, N_q, d)
+        S = H_support.unsqueeze(0)  # (1, N_s, d)
+        M = self.mediator_init.expand(Q.size(0), -1, -1)  # (1, m, d)
+
+        for layer in self.layers:
+            M, Q, S = layer(M, Q, S)
+
+        Q_out = self.q_proj(Q.squeeze(0))   # (N_q, d)
+        S_out = self.s_proj(S.squeeze(0))   # (N_s, d)
+        return Q_out, S_out
+
+
+# ── DEKAE Model Definition ──────────────────────────────────────────────────
+
+class DEKAEModel(nn.Module):
+    """
+    Dynamic Edge-driven topology for Episodic few-shot learning (DEKAE).
+    """
+
+    def __init__(self, embed_dim: int = 128, n_gnn_layers: int = 3,
+                 rank: int = 16, sparsity_mode: str = "l1",
+                 lambda_sparse: float = 0.01, lambda_edge: float = 0.5,
+                 topk_k: int = 5, n_way: int = 5, use_dynamic: bool = True,
+                 use_edge_proj: bool = True, use_case2: bool = True,
+                 edge_dropout: float = 0.1,
+                 use_lmt: bool = True, n_mediators: int = 8,
+                 lmt_layers: int = 3, lmt_heads: int = 4, lmt_dropout: float = 0.1,
+                 lmt_init_strategy: str = "learned", lmt_phases: str = "both",
+                 edge_loss_mode: str = "all",
+                 adj_residual: float = 0.15,
+                 edge_proj_type: str = "mlp"):
+                 # edge_proj_type: 'mlp' (default/C3) | 'linear' (C2) | 'none' (C1)
+                 # Controls how EdgeIncidenceModule computes edge features.
+                 # Group C ablation (plan §5.3) sweeps these three values.
+        super().__init__()
+        self.embed_dim        = embed_dim
+        self.n_gnn_layers     = n_gnn_layers
+        self.n_way            = n_way
+        self.use_dynamic      = use_dynamic
+        self.use_edge_proj    = use_edge_proj
+        self.use_case2        = use_case2
+        self.use_lmt          = use_lmt
+        self.edge_loss_mode   = edge_loss_mode
+        self.adj_residual     = adj_residual   # anti-collapse: blend A' with k-NN
+        self.knn_k            = topk_k
+        self.lambda_edge      = lambda_edge
+        self.edge_proj_type   = edge_proj_type  # Group C ablation flag
+
+        self.backbone = Conv4(embed_dim=embed_dim)
+
+        # Edge incidence modules (shared across both cases)
+        # edge_proj_type controls Group C ablation: 'mlp'(C3) / 'linear'(C2) / 'none'(C1)
+        self.edge_modules = nn.ModuleList([
+            EdgeIncidenceModule(embed_dim, embed_dim, hidden=64,
+                                edge_proj_type=edge_proj_type)
+            for _ in range(n_gnn_layers)
+        ])
+        # Dynamic topology modules
+        self.dynamic_modules = nn.ModuleList([
+            DynamicTopologyModule(embed_dim, rank, embed_dim,
+                                  sparsity_mode, topk_k, lambda_sparse,
+                                  edge_dropout)
+            for _ in range(n_gnn_layers)
+        ])
+
+        # ── Case 2: EdgeToNodeProjection  (default — the stronger novelty) ────
+        # X' = A_edge @ E @ W'   nodes updated from EDGE VECTORS
+        self.e2n_modules = nn.ModuleList([
+            EdgeToNodeProjection(embed_dim, embed_dim)
+            for _ in range(n_gnn_layers)
+        ])
+
+        # ── Case 1: EdgeAwareKnowledgeFilter  (ablation A3, use_case2=False) ──
+        # X' = σ(g(E)) · A' @ H   classic node aggregation, gated by edge agg.
+        self.kf_modules = nn.ModuleList([
+            EdgeAwareKnowledgeFilter(embed_dim, embed_dim)
+            for _ in range(n_gnn_layers)
+        ])
+
+        # ── Latent Mediator Transformer (optional) ────────────────────────────
+        if use_lmt:
+            self.lmt = LatentMediatorTransformer(
+                embed_dim      = embed_dim,
+                n_mediators    = n_mediators,
+                n_layers       = lmt_layers,
+                n_heads        = lmt_heads,
+                dropout        = lmt_dropout,
+                init_strategy  = lmt_init_strategy,   # H4 ablation
+                phases         = lmt_phases,           # H5 ablation
+            )
+        else:
+            self.lmt = None
+
+        self.classifier = nn.Linear(embed_dim, n_way)
+
+    # ── Ablation toggle helpers ───────────────────────────────────────────────
+    def set_use_dynamic(self, flag: bool):
+        self.use_dynamic = flag
+
+    def set_use_edge_proj(self, flag: bool):
+        """False → ablation A2 (dynamic rewiring only, no edge-aware update)."""
+        self.use_edge_proj = flag
+
+    def set_use_case2(self, flag: bool):
+        """True  → Case 2  X' = A_edge @ E @ W'  (full novelty, ablation A4)
+           False → Case 1  X' = σ(g(E)) · A' @ H (edge-gated node agg, A3)."""
+        self.use_case2 = flag
+
+    def set_use_lmt(self, flag: bool):
+        self.use_lmt = flag
+
+    # ── Forward ───────────────────────────────────────────────────────────────
+    def forward(self, imgs_support: torch.Tensor, labels_support: torch.Tensor,
+                imgs_query: torch.Tensor, lambda_edge_scale: float = 1.0):
+        """
+        imgs_support      : (N_s, 3, 84, 84)
+        labels_support    : (N_s,)
+        imgs_query        : (N_q, 3, 84, 84)
+        lambda_edge_scale : curriculum multiplier [0, 1] for edge loss
+
+        Returns
+        -------
+        logits   : (N_q, n_way)
+        aux_loss : edge correction loss + sparsity losses
+        metrics  : dict with graph quality statistics
+        """
+        N_s = imgs_support.size(0)
+        N_q = imgs_query.size(0)
+
+        # ── 1. Encode all nodes ───────────────────────────────────────────────
+        all_imgs = torch.cat([imgs_support, imgs_query], dim=0)    # (N, ...)
+        H0       = self.backbone(all_imgs)                          # (N, d)
+
+        # Support mask — query labels never used in any loss term
+        support_mask = torch.zeros(N_s + N_q, dtype=torch.bool, device=H0.device)
+        support_mask[:N_s] = True
+
+        H = H0
+        total_sparsity_loss = torch.tensor(0.0, device=H0.device)
+        total_edge_loss     = torch.tensor(0.0, device=H0.device)
+        layer_stability     = []
+        intra_edge_ratio    = 0.0
+        inter_edge_ratio    = 0.0
+
+        for l in range(self.n_gnn_layers):
+            # ── 2. Initial adjacency ──────────────────────────────────────────
+            A_init = build_knn_adjacency(H, k=self.knn_k)
+
+            # ── 3. Edge features  E = B^T X W ────────────────────────────────
+            E, src, dst = self.edge_modules[l](H, A_init)
+
+            if self.use_dynamic:
+                # ── 4. Dynamic topology A' ────────────────────────────────────
+                A_prime, sp_loss = self.dynamic_modules[l](H, E, src, dst)
+
+                # ── Anti-collapse residual blend (Risk: density → 0) ──────────
+                # The optimizer can zero all edges to minimise edge+sparsity loss.
+                # Blending with the k-NN baseline guarantees minimum connectivity.
+                # adj_residual=0.15 means at least 15% of k-NN structure survives.
+                if self.adj_residual > 0:
+                    A_prime = (1.0 - self.adj_residual) * A_prime \
+                              + self.adj_residual * A_init
+
+                # Divide by n_gnn_layers to avoid 3× sparsity amplification
+                total_sparsity_loss = total_sparsity_loss + sp_loss / self.n_gnn_layers
+
+                # ── 5. Edge correction loss (support-support only) ────────────
+                labels_full = torch.full((N_s + N_q,), -1,
+                                         dtype=torch.long, device=H.device)
+                labels_full[:N_s] = labels_support
+                e_loss_l = edge_correction_loss(E, src, dst, H, labels_full,
+                                                support_mask)
+
+                # Group I: multi-level edge supervision (plan §5.9)
+                # 'all' / I2      — equal weight at every layer (default)
+                # 'penultimate' / I1 — only final GNN layer
+                # 'decaying' / I3 — weight decreases with layer index l
+                if self.edge_loss_mode == "penultimate":
+                    if l == self.n_gnn_layers - 1:
+                        total_edge_loss = total_edge_loss + e_loss_l * lambda_edge_scale
+                elif self.edge_loss_mode == "decaying":
+                    # weight = 1 / (L - l), higher weight for later layers
+                    decay_w = 1.0 / max(self.n_gnn_layers - l, 1)
+                    total_edge_loss = total_edge_loss + e_loss_l * lambda_edge_scale * decay_w
+                else:  # "all" (default, I2 — equal weight)
+                    total_edge_loss = total_edge_loss + e_loss_l * lambda_edge_scale
+
+                # Intra/inter ratio diagnostics (last layer only)
+                if l == self.n_gnn_layers - 1:
+                    with torch.no_grad():
+                        ss_mask = support_mask[src] & support_mask[dst]
+                        if ss_mask.sum() > 0:
+                            ss_src = src[ss_mask]; ss_dst = dst[ss_mask]
+                            same = (labels_full[ss_src] == labels_full[ss_dst]).float()
+                            intra_edge_ratio = same.mean().item()
+                            inter_edge_ratio = 1.0 - intra_edge_ratio
+            else:
+                A_prime = A_init          # static fallback (warm-up / ablation A1)
+
+            # ── 6. Node update: Case 2 (default) or Case 1 (ablation) ─────────
+            if self.use_edge_proj:
+                if self.use_case2:
+                    # ★ Case 2: X' = A_edge @ E @ W'  ← the stronger novelty
+                    #   Nodes updated from EDGE FEATURE VECTORS, not node features
+                    _, H_new = self.e2n_modules[l](H, E, src, dst)
+                else:
+                    # Case 1 ablation (A3): edge-gated node aggregation
+                    _, H_new = self.kf_modules[l](H, E, src, dst, A_prime)
+            else:
+                # A2 ablation: dynamic topology, simple message passing only
+                H_new = A_prime @ H
+
+            H_new = H_new + H0                                # skip connection
+
+            with torch.no_grad():
+                stability = (H_new - H).norm().item()
+            layer_stability.append(stability)
+            H = H_new
+
+        # ── 7. Split support / query ──────────────────────────────────────────
+        H_support = H[:N_s]                                    # (N_s, d)
+        H_query   = H[N_s:]                                    # (N_q, d)
+
+        # ── 8. Latent Mediator Transformer (Optional) ─────────────────────────
+        if self.use_lmt and self.lmt is not None:
+            # Cross-set refinement via latent mediators
+            H_query, H_support = self.lmt(H_query, H_support)
+
+        # ── 9. Compute Prototypes ─────────────────────────────────────────────
+        prototypes = torch.zeros(self.n_way, self.embed_dim, device=H.device)
+        for c in range(self.n_way):
+            mask_c = labels_support == c
+            if mask_c.sum() > 0:
+                prototypes[c] = H_support[mask_c].mean(dim=0)
+
+        # ── 10. Cosine Classifier ─────────────────────────────────────────────
+        # NaN-safe normalisation: clamp near-zero vectors before cosine similarity
+        # (zero vectors arise when prototype class has collapsed features)
+        H_q_norm   = F.normalize(H_query.clamp(-1e4, 1e4),    dim=-1, eps=1e-8)
+        proto_norm = F.normalize(prototypes.clamp(-1e4, 1e4), dim=-1, eps=1e-8)
+        logits     = H_q_norm @ proto_norm.t()                 # (N_q, n_way)
+
+        aux_loss = total_edge_loss * self.lambda_edge + total_sparsity_loss
+
+        metrics = graph_metrics(A_prime)
+        metrics["layer_stability"]  = layer_stability
+        metrics["intra_edge_ratio"] = intra_edge_ratio
+        metrics["inter_edge_ratio"] = inter_edge_ratio
+
+        return logits, aux_loss, metrics
+
+
+# ── Sanity checks ─────────────────────────────────────────────────────────────
+
+# Full model: Case 2 + LMT
+_model = DEKAEModel(n_way=5, embed_dim=128, use_case2=True,
+                    use_lmt=True, n_mediators=8, lmt_layers=3).to(DEVICE)
+_s_imgs = torch.randn(5, 3, 84, 84).to(DEVICE)
+_s_lbl  = torch.arange(5).to(DEVICE)
+_q_imgs = torch.randn(15, 3, 84, 84).to(DEVICE)
+_logits, _aloss, _mets = _model(_s_imgs, _s_lbl, _q_imgs)
+print("── Full model (Case 2 + LMT) ──")
+print(f"  Logits : {_logits.shape}  Aux loss : {_aloss.item():.4f}")
+print(f"  Density: {_mets['graph_density']:.3f}  Intra-edge: {_mets['intra_edge_ratio']:.3f}")
+n_param = sum(p.numel() for p in _model.parameters())
+print(f"  Total params: {n_param:,}")
+
+# Ablation A3 (Case 1, no LMT)
+_model_c1 = DEKAEModel(n_way=5, embed_dim=128,
+                        use_case2=False, use_lmt=False).to(DEVICE)
+_logits_c1, _, _ = _model_c1(_s_imgs, _s_lbl, _q_imgs)
+print(f"\n── Ablation A3 (Case 1, no LMT) — logits: {_logits_c1.shape}")
+
+# Ablation A2 (no edge proj, dynamic only)
+_model_a2 = DEKAEModel(n_way=5, embed_dim=128,
+                        use_edge_proj=False, use_lmt=False).to(DEVICE)
+_logits_a2, _, _ = _model_a2(_s_imgs, _s_lbl, _q_imgs)
+
+print(f"── Ablation A2 (dynamic only, no edge proj) — logits: {_logits_a2.shape}")
