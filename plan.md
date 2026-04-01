@@ -30,12 +30,12 @@ This document compiles and organizes strategic advice for extending the FSAKE (*
 ## 1. Conceptual Integration & Research Roadmap
 
 ### 1.1 Overview of Current Baseline vs. Proposed Novelty
-* **Base Paper (FSAKE)**: Uses graph-level few-shot learning, a **static k-NN graph**, neighbor-aware node scoring, intermediate supervision, and node-based pooling over a Graph U-Net backbone.
-* **Your Novelty**: Introduces an explicit edge incidence matrix ($B$), learned edge features ($E = BXW$), dynamic topology reconstruction, and edge-to-node projection ($X' = A'EW'$). 
-* **Core Difference**: FSAKE improves *node selection*, whereas your method improves *how the topology is constructed and updated*. This is a foundational upgrade.
+* **Base Paper (FSAKE)**: Uses graph-level few-shot learning. Importantly, FSAKE already uses a **dynamic MLP-computed adjacency**: at every GNN layer it recomputes $A^{(l)} = \text{MLP}_{abs}(X^{(l)})$ via element-wise absolute-difference features passed through a 4-conv network followed by softmax. The graph is *not* static k-NN — HGNN (the predecessor baseline) uses static adjacency. FSAKE initializes edges from a label-derived binary matrix (`label2edge`) for support×support and 0.5 for query edges, then re-learns topology from node features at every layer. Node input dim is `emb_size + num_ways` (e.g., 128+5=133) because one-hot class labels (support) / uniform padding (queries) are concatenated before the graph module. FSAKE's "knowledge correction" is **graph pooling** (GCN-scored node selection via `pool_mode`: `kn`/`support`/`way`), not an edge-level loss. Training uses dual-output intermediate supervision: $\mathcal{L} = \mathcal{L}_{final} + 0.5 \cdot \mathcal{L}_{intermediate}$.
+* **Your Novelty**: Introduces an explicit edge incidence matrix ($B$), learned **vector-valued** edge features ($E = BXW$), dynamic topology reconstruction, and edge-to-node projection ($X' = A'EW'$). Also adds a supervised edge-level loss on support–support pairs.
+* **Core Difference**: FSAKE already learns dynamic topology, but via **scalar soft-weighted adjacency** (a $N\times N$ matrix of scalar attention weights from node differences). DEKAE replaces this with **vector-valued edge features** via the incidence formulation — each edge carries a $d$-dimensional feature vector rather than a single scalar weight. This enables edge-level supervised loss, which is structurally impossible in scalar-attention formulations.
 
 ### 1.2 Conceptual Integration Strategy (DEKAE Framework)
-* **Step 1: Replace Static k-NN**: Shift from fixed static adjacency to dynamic topology based on edge features ($A^{(l)} = f(E^{(l)})$).
+* **Step 1: Upgrade Scalar to Vector Adjacency**: FSAKE already shifts topology at each layer via a scalar MLP adjacency. Replace this scalar soft-weight mechanism with an incidence-based formulation producing vector-valued edge features ($E^{(l)} = B^T X^{(l)} W$, $A^{(l)} = f(E^{(l)})$). The key upgrade: FSAKE's MLP outputs a $N\times N$ scalar matrix; DEKAE produces a $|E|\times d$ edge feature matrix, enabling richer relational supervision.
 * **Step 2: Merge Knowledge Filtering with Edge Awareness**: Node importance should now depend heavily on dynamic edge representation, not just simple 1-hop neighbors.
 * **Step 3: Upgrade Knowledge Correction**: Introduce edge-level correction loss — **applied only to support–support edges** (where labels are known), never directly to support–query edges. This is critical to avoid label leakage (see Risk 5 in §1.5). Intra-class support pairs are pulled toward high cosine similarity; inter-class support pairs are pushed apart. The resulting learned topology then propagates to query nodes through message passing without ever using query labels as a supervision signal.
 * **Step 4: Full Architecture**: 
@@ -58,8 +58,8 @@ To frame your novelty theoretically, make the following claims:
 5. **Why the Incidence Matrix $B$ Is Not Just Notation**: This is a frequent reviewer objection — *"isn't this just attention with extra steps?"* You must address it directly.
    * $B \in \{0,1\}^{N \times |E|}$ maps each edge to exactly two incident nodes; computing $E = BXW$ is equivalent to running convolution on the **line graph** $\mathcal{L}(G)$ of the original graph. Line-graph convolution is *provably different* from node-level attention: it treats edges as first-class objects, not weighting scalars.
    * Attention ($\text{softmax}(QK^T/\sqrt{d})$) produces a scalar influence weight per edge — a 1D signal. The incidence formulation produces a **vector feature** $e_{ij} \in \mathbb{R}^{d}$ per edge — a $d$-dimensional signal that can capture asymmetric, directional, or heterogeneous relational patterns.
-   * Static k-NN builds $B$ once from Euclidean distance and never updates it. Your method recomputes $B$ — and therefore the entire line-graph — at each layer, enabling **hierarchical relational refinement** not possible with fixed adjacency.
-   * Include a one-paragraph comparison in your Related Work: *"Although GAT (Veličković et al., 2018) and DGCNN (Wang et al., 2019) also produce edge-conditioned outputs, they discard the edge vectors after aggregation. Our incidence formulation retains them as explicit latent variables enabling edge-level loss supervision, which is structurally impossible in scalar-attention formulations."*
+   * HGNN (the FSAKE predecessor baseline) builds $A$ once from Euclidean distance. FSAKE already recomputes the adjacency at each layer — but as a scalar matrix from node difference features. Your method recomputes $B$ and produces vector edge features at each layer, enabling **hierarchical relational refinement** and supervised edge-level loss not possible with scalar-attention adjacency.
+   * Include a one-paragraph comparison in your Related Work: *"Although GAT (Veličković et al., 2018), DGCNN (Wang et al., 2019), and FSAKE (which uses an MLP over node differences to produce per-layer scalar adjacency) also perform dynamic topology updates, they all discard edge information after computing scalar aggregation weights. Our incidence formulation retains edges as explicit latent variable vectors enabling edge-level loss supervision, which is structurally impossible in scalar-attention formulations."*
 
 ### 1.4 Strategic Research Directions
 * **Direction 1 (Safe)**: Edge-driven FSAKE (Low risk, moderate novelty).
@@ -262,8 +262,8 @@ project/
 ├── backbones/
 │   └── conv4.py               ← MUST use the exact same backbone as FSAKE (e.g., 128-dim Conv4)
 ├── graphs/
-│   ├── static_knn.py          ← FSAKE baseline module
-│   └── dynamic_edge.py        ← YOUR method module
+│   ├── scalar_mlp_adj.py      ← FSAKE baseline module (dynamic scalar-weighted adjacency)
+│   └── dynamic_edge.py        ← YOUR method module (incidence-based vector edge features)
 ├── models/
 │   ├── fsake_model.py
 │   └── your_model.py
@@ -274,7 +274,7 @@ project/
 
 ### 3.2 Baselines to Include
 * **Classical**: Prototypical Networks, Matching Networks.
-* **Graph-Based**: GNN (Garcia & Bruna), HGNN, FSAKE, EdgeConv (DGCNN-style).
+* **Graph-Based**: GNN (Garcia & Bruna), HGNN (static adjacency), FSAKE (dynamic scalar MLP adjacency), EdgeConv (DGCNN-style).
 * **Dynamic Graph Methods** (new — required to address novelty overlap): EvolveGCN, IDGL (Iterative Deep Graph Learning), LDS (Learned Discrete Structure). Adapting any of these to the episodic setting and comparing directly closes the novelty gap argument.
 
 > **Why this matters**: Reviewers familiar with the dynamic GNN literature will point to DGCNN/IDGL and ask "what is novel beyond this?" Including them as baselines and showing your episodic edge-supervision outperforms them preemptively closes that objection.
@@ -316,23 +316,23 @@ This proves that your environment is fair, you faithfully reproduced the baselin
 ## 5. Detailed Ablation Plan
 
 ### 5.1 Group A: Topology Dynamics
-**Goal**: Show that dynamic graph improves over static k-NN, and that Case 2 (edge-vector update) outperforms Case 1 (node aggregation). Also, explicitly isolate the contribution of edge-driven design against the original FSAKE components (Knowledge Filtering, KF and Knowledge Correction, KC).
+**Goal**: Show that vector-valued edge features (DEKAE) improve over FSAKE's scalar-weighted dynamic adjacency, and that Case 2 (edge-vector update) outperforms Case 1 (node aggregation). Also, explicitly isolate the contribution of the incidence-based design against the original FSAKE components (Knowledge Filtering, KF and Knowledge Correction, KC). Note: FSAKE (A2) already uses dynamic topology via its scalar MLP adjacency; A1 (HGNN) is the static-adjacency baseline.
 
 | Variant            | Static k-NN | Dynamic Rewiring | Node update                      | Edge Loss / KC  | Knowledge Filtering (KF) |
 | ------------------ | ----------- | ---------------- | -------------------------------- | --------------- | ------------------------ |
-| A1 Baseline (HGNN) | ✅           | ❌                | $A X W$ (node agg.)              | ❌               | ❌                        |
-| A2 FSAKE (KF + KC) | ✅           | ❌                | $A X W$ (node agg.)              | KC (Node-level) | ✅                        |
+| A1 Baseline (HGNN) | ✅ (static)  | ❌                | $A X W$ (node agg.)              | ❌               | ❌                        |
+| A2 FSAKE (KF + KC) | ❌           | ✅ (scalar MLP)   | $A^{(l)} X W$ (per-layer reinit) | KC (node pool)  | ✅                        |
 | A3                 | ❌           | ✅                | $A' X W$ (simple MP)             | ❌               | ❌                        |
 | A4                 | ❌           | ✅                | Case 1: $\sigma(g(E)) \cdot A'H$ | ❌               | ✅                        |
 | A5                 | ❌           | ✅                | **Case 2**: $A_{edge} E W'$      | ❌               | ✅                        |
 | A6 Full            | ❌           | ✅                | **Case 2**: $A_{edge} E W'$      | Edge Loss (New) | ✅                        |
 
 *What this proves*:
-* `A2 − A1` → effect of original FSAKE components (KF + KC) over raw HGNN
-* `A3 − A1` → effect of dynamic topology alone
-* `A4 − A3` → effect of edge-feature gating on node aggregation (Case 1)
+* `A2 − A1` → effect of FSAKE's scalar dynamic adjacency + node pooling (KF + KC) over static HGNN
+* `A3 − A1` → effect of incidence-based dynamic topology alone (without edge loss or KF)
+* `A4 − A3` → effect of edge-feature gating on node aggregation (Case 1) over simple dynamic topology
 * `A5 − A4` → effect of the true edge-to-node projection (Case 2 — the stronger novelty)
-* `A6 − A2` → direct comparison showing that dynamic edge topology + edge loss outperforms static k-NN + node-level KC
+* `A6 − A2` → direct comparison: vector edge features + supervised edge loss vs. FSAKE's scalar MLP adjacency + node-level pooling; note that A2 (FSAKE) already has dynamic topology, so this gap isolates the *quality* of the edge representation
 
 Code flags: `use_edge_proj`, `use_case2`, `use_lmt` in `DEKAEModel` map directly to each variant.
 
@@ -425,8 +425,8 @@ Run with at least two backbones (Conv4 and ResNet-12 if feasible) to confirm the
 | ResNet-12 (if feasible) | (report)  | (report) | (report) |
 
 #### G4: Dataset Resolution Sensitivity (e.g., CIFAR-FS)
-**Observation from FSAKE**: On CIFAR-FS (low-resolution 32x32 images), FSAKE's 5-shot accuracy slightly trailed HGNN (85.92 vs. 86.16), because low resolution introduces "false neighbor information" in static k-NN graphs.
-**Goal**: Show that dynamic topology is especially beneficial here, learning to ignore spurious similarities.
+**Observation from FSAKE**: On CIFAR-FS (low-resolution 32x32 images), FSAKE's 5-shot accuracy slightly trailed HGNN (85.92 vs. 86.16). Since HGNN uses a static proximity-based adjacency and FSAKE re-learns adjacency via MLP-abs-diff softmax, the gap suggests that on low-resolution features the scalar MLP adjacency still introduces spurious relational weights that hurt 5-shot performance.
+**Goal**: Show that DEKAE's vector-valued edge features provide richer signal to distinguish genuine class relationships from noise, especially when backbone features are less discriminative at low resolution.
 
 | Dataset      | Resolution | Baseline HGNN (5-shot) | FSAKE (5-shot) | Ours (5-shot) |
 | ------------ | ---------- | ---------------------- | -------------- | ------------- |
@@ -577,8 +577,9 @@ Generate these plots to make a visually convincing argument. Leverage the FSAKE 
     * Line-Graph Convolution — position $B$ formulation relative to line-graph theory
 3. **Method**
     * **Formal Problem Statement** *(mandatory — do not skip)*: Before any architecture description, state the episodic FSL problem formally. Define: (a) the meta-training distribution $p(\mathcal{T})$ over tasks; (b) a single episode $\mathcal{T} = (\mathcal{S}, \mathcal{Q})$ where $\mathcal{S} = \{(x_i, y_i)\}_{i=1}^{NK}$ is the support set and $\mathcal{Q}$ is the query set; (c) the episode graph $\mathcal{G} = (\mathcal{V}, \mathcal{E}, A)$ where nodes are support + query samples; (d) the model's objective: learn $f_\theta$ such that $\mathbb{E}_{\mathcal{T} \sim p(\mathcal{T})}[\mathcal{L}_{class}(\mathcal{Q} | f_\theta(\mathcal{S}))]$ is minimized. This formalization is expected by reviewers and makes the edge-supervision loss placement (support-support only) self-evident from notation. Without it, a reviewer can object that the episodic protocol is not clearly defined.
-    * **Preliminaries**: Notation for graph, incidence matrix $B$, edge feature matrix $E$.
-    * Edge Incidence Representation (justify $B$ vs. attention — §1.3 point 5)
+    * **Preliminaries**: Notation for graph, incidence matrix $B$, edge feature matrix $E$. Also define FSAKE's scalar adjacency for comparison: $A^{(l)}_{ij} = \text{MLP}_{abs}(|h_i^{(l)} - h_j^{(l)}|)$, where the output is a single scalar per pair. Contrast with your formulation where each edge carries a $d$-dimensional vector.
+    * **Note on node input features**: Following FSAKE, node features input to the graph module are `[backbone_emb ∥ class_label_encoding]` of dimension `emb_size + num_ways`. Support nodes use one-hot class labels; query nodes use uniform distribution $1/N_{way}$. This label-augmented representation is preserved in DEKAE.
+    * Edge Incidence Representation (justify $B$ vs. scalar-attention adjacency — §1.3 point 5)
     * Dynamic Edge Feature Learning
     * Adaptive Topology Reconstruction & Message Passing (with sparsity constraints)
     * Knowledge Filtering with Edge Awareness
@@ -586,7 +587,7 @@ Generate these plots to make a visually convincing argument. Leverage the FSAKE 
     * Regularization & Stability Constraints (L1 + Laplacian for variable-degree; top-k only in ablation)
     * **Latent Mediator Transformer** (cross-set refinement — §1.7): position as a post-GNN module that refines both $H_Q$ and $H_S$ through a complexity-efficient bottleneck before prototype classification. Justify complexity advantage and differentiate from Perceiver IO and direct cross-attention.
 4. **Theoretical Analysis** — *must include at minimum*:
-    * **Proposition 1 (Expressivity)**: *The set of graphs representable by our dynamic rewiring strictly contains the set of static k-NN graphs as a strict special case.* Proof sketch: if the edge scoring function $f(h_i, h_j) = -\|h_i - h_j\|_2$ (negative Euclidean distance) and the resulting scores are followed by a hard top-$k$ mask, the learned topology exactly recovers static $k$-NN from feature space. Because our hypothesis class allows any learnable $f$ beyond this distance function — including asymmetric bilinear forms, MLP scorers, and soft rather than hard thresholds — static $k$-NN is a strict subset of our model family. This makes the proposition airtight: it is not merely that we generalize distance-based construction, but that we make the *hard top-k on Euclidean distance* recoverable as a degenerate configuration.
+    * **Proposition 1 (Expressivity)**: *The DEKAE edge representation strictly generalizes FSAKE's scalar adjacency as a special case.* Proof sketch: FSAKE computes $A^{(l)}_{ij} = \text{softmax}(\text{MLP}(|h_i - h_j|))$, a scalar per pair. DEKAE computes $e_{ij} = B_{ij}^T X W \in \mathbb{R}^d$ (a $d$-dimensional vector per pair) and then $A^{(l)}_{ij} = g(e_{ij})$ where $g$ can be any function. Setting $g$ to the dot product $g(e_{ij}) = w^T e_{ij}$ recovers a 1D scalar equivalent to FSAKE's scalar weighting. Because our hypothesis class allows any $d$-dimensional function of edge vectors beyond this degenerate dot-product aggregation — and retains the full edge vector for supervised loss — FSAKE's scalar adjacency is a strict degenerate subset of DEKAE.
     * **Proposition 2 (Complexity)**: $O(N^2 d)$ per layer, matching Transformer self-attention — no asymptotic overhead.
     * **Proposition 3 (Convergence Remark — mandatory to include)**: Address the convergence of the dynamic adjacency feedback loop explicitly. The loop is: node representations $H^{(l)}$ → edge scoring $f(H^{(l)})$ → topology $A^{(l+1)}$ → message passing → $H^{(l+1)}$. This is a fixed-point iteration, and unbounded dynamics will cause divergence (Risk 7). Provide the following discussion:
       * *Sufficient condition for convergence*: If the edge scoring function $f$ is Lipschitz-continuous with constant $L_f$, and the message-passing operator $\text{MP}$ is also Lipschitz with constant $L_{MP}$, then the composed map $H \mapsto \text{MP}(f(H)) \cdot H$ is a contraction when $L_f \cdot L_{MP} < 1$. Under this condition, the Banach fixed-point theorem guarantees convergence to a unique fixed point $H^*$.

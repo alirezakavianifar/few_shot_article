@@ -1,0 +1,52 @@
+# Cloned external repositories (large, not tracked)
+FSAKE/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints/
+
+# Virtual environments
+.venv/
+venv/
+env/
+.env
+
+# Distribution / packaging
+*.whl
+*.tar.gz
+*.zip
+
+# Dataset files (large binaries)
+*.pickle
+*.pkl
+*.npz
+*.npy
+*.h5
+*.hdf5
+
+# Model checkpoints (large binaries)
+*.pth
+*.pth.tar
+*.pt
+*.ckpt
+
+# OS artefacts
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.suo
+*.user
