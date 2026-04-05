@@ -6,6 +6,89 @@ import os
 import random
 import time
 
+# ── Hugging Face Hub auto-checkpoint (optional, activated via env vars) ──────
+# Set these env vars before running train.py to enable automatic HF pushes:
+#   HF_TOKEN      – your HuggingFace write token
+#   HF_USERNAME   – your HuggingFace username  (default: derived from token)
+#   HF_REPO_NAME  – repo name                  (default: fsake-checkpoints)
+# The notebook's Step 5A cell already writes these to /tmp/fsake_hf_config.json
+# and the training cell sources them as environment variables.
+_HF_ENABLED = False
+_hf_api      = None
+_HF_REPO_ID  = None
+
+def _init_hf():
+    """Initialise Hugging Face Hub if credentials are available."""
+    global _HF_ENABLED, _hf_api, _HF_REPO_ID
+    try:
+        import json
+        token    = os.environ.get('HF_TOKEN', '')
+        username = os.environ.get('HF_USERNAME', '')
+        repo     = os.environ.get('HF_REPO_NAME', 'fsake-checkpoints')
+
+        # Fall back to the JSON config written by the notebook setup cell
+        if not token or not username:
+            cfg_path = '/tmp/fsake_hf_config.json'
+            if os.path.exists(cfg_path):
+                with open(cfg_path) as f:
+                    cfg = json.load(f)
+                username = username or cfg.get('HF_USERNAME', '')
+                repo_id  = cfg.get('HF_REPO_ID', '')
+                if repo_id:
+                    repo = repo_id.split('/')[-1]
+
+        if not username:
+            return  # No credentials – silently skip
+
+        from huggingface_hub import HfApi, login
+        if token:
+            login(token=token, add_to_git_credential=False)
+        _hf_api     = HfApi()
+        _HF_REPO_ID = f'{username}/{repo}'
+        _HF_ENABLED = True
+        print(f'[HF] Checkpoint auto-push ENABLED → {_HF_REPO_ID}')
+    except Exception as e:
+        print(f'[HF] Auto-push disabled ({e})')
+
+
+def _push_checkpoint_to_hf(exp_name, filename):
+    """Upload a single checkpoint file to the HF repo (non-blocking best-effort)."""
+    if not _HF_ENABLED:
+        return
+    local_path = f'asset/checkpoints/{exp_name}/{filename}'
+    if not os.path.exists(local_path):
+        return
+    try:
+        _hf_api.upload_file(
+            path_or_fileobj=local_path,
+            path_in_repo=f'{exp_name}/{filename}',
+            repo_id=_HF_REPO_ID,
+            repo_type='model',
+        )
+        print(f'[HF] ✓ Pushed {exp_name}/{filename} → {_HF_REPO_ID}')
+    except Exception as e:
+        print(f'[HF] ✗ Push failed for {filename}: {e}')
+
+
+def _pull_checkpoint_from_hf(exp_name):
+    """Download model_best.pth.tar from HF to resume a previous session."""
+    if not _HF_ENABLED:
+        return
+    local_best = f'asset/checkpoints/{exp_name}/model_best.pth.tar'
+    if os.path.exists(local_best):
+        return  # Already present – nothing to do
+    try:
+        from huggingface_hub import hf_hub_download
+        cached = hf_hub_download(
+            repo_id=_HF_REPO_ID,
+            filename=f'{exp_name}/model_best.pth.tar',
+            repo_type='model',
+        )
+        shutil.copy(cached, local_best)
+        print(f'[HF] ✓ Pulled checkpoint from {_HF_REPO_ID} → {local_best}')
+    except Exception as e:
+        print(f'[HF] No previous checkpoint on HF to resume from ({e})')
+
 class ModelTrainer(object):
     def __init__(self,
                  enc_module,
@@ -333,6 +416,9 @@ class ModelTrainer(object):
         if is_best:
             shutil.copyfile('asset/checkpoints/{}/'.format(tt.arg.experiment) + 'checkpoint.pth.tar',
                             'asset/checkpoints/{}/'.format(tt.arg.experiment) + 'model_best.pth.tar')
+            # Push both files to Hugging Face Hub so they survive Colab resets
+            _push_checkpoint_to_hf(tt.arg.experiment, 'model_best.pth.tar')
+            _push_checkpoint_to_hf(tt.arg.experiment, 'checkpoint.pth.tar')
 
 def set_exp_name():
     exp_name = 'D-{}'.format(tt.arg.dataset)
@@ -461,6 +547,10 @@ if __name__ == '__main__':
         os.makedirs('asset/checkpoints')
     if not os.path.exists('asset/checkpoints/' + tt.arg.experiment):
         os.makedirs('asset/checkpoints/' + tt.arg.experiment)
+
+    # Initialise HF auto-push and try to pull the latest best checkpoint
+    _init_hf()
+    _pull_checkpoint_from_hf(tt.arg.experiment)
 
     enc_module = EmbeddingImagenet(emb_size=tt.arg.emb_size)
 
