@@ -71,23 +71,37 @@ def _push_checkpoint_to_hf(exp_name, filename):
 
 
 def _pull_checkpoint_from_hf(exp_name):
-    """Download model_best.pth.tar from HF to resume a previous session."""
+    """Download checkpoint.pth.tar (preferred) and/or model_best.pth.tar from HF."""
     if not _HF_ENABLED:
         return
+    from huggingface_hub import hf_hub_download
+
+    local_ckpt = f'asset/checkpoints/{exp_name}/checkpoint.pth.tar'
     local_best = f'asset/checkpoints/{exp_name}/model_best.pth.tar'
-    if os.path.exists(local_best):
-        return  # Already present – nothing to do
-    try:
-        from huggingface_hub import hf_hub_download
-        cached = hf_hub_download(
-            repo_id=_HF_REPO_ID,
-            filename=f'{exp_name}/model_best.pth.tar',
-            repo_type='model',
-        )
-        shutil.copy(cached, local_best)
-        print(f'[HF] ✓ Pulled checkpoint from {_HF_REPO_ID} → {local_best}')
-    except Exception as e:
-        print(f'[HF] No previous checkpoint on HF to resume from ({e})')
+
+    if not os.path.exists(local_ckpt):
+        try:
+            cached = hf_hub_download(
+                repo_id=_HF_REPO_ID,
+                filename=f'{exp_name}/checkpoint.pth.tar',
+                repo_type='model',
+            )
+            shutil.copy(cached, local_ckpt)
+            print(f'[HF] ✓ Pulled checkpoint.pth.tar from {_HF_REPO_ID} → {local_ckpt}')
+        except Exception as e:
+            print(f'[HF] No checkpoint.pth.tar on HF ({e})')
+
+    if not os.path.exists(local_best):
+        try:
+            cached = hf_hub_download(
+                repo_id=_HF_REPO_ID,
+                filename=f'{exp_name}/model_best.pth.tar',
+                repo_type='model',
+            )
+            shutil.copy(cached, local_best)
+            print(f'[HF] ✓ Pulled model_best.pth.tar from {_HF_REPO_ID} → {local_best}')
+        except Exception as e:
+            print(f'[HF] No model_best.pth.tar on HF ({e})')
 
 class ModelTrainer(object):
     def __init__(self,
@@ -123,6 +137,56 @@ class ModelTrainer(object):
         self.global_step = 0
         self.val_acc = 0
         self.test_acc = 0
+
+    def load_checkpoint(self, ckpt_path=None):
+        """Load weights, optimizer, and global_step from disk. Prefer checkpoint.pth.tar."""
+        exp_dir = 'asset/checkpoints/{}'.format(tt.arg.experiment)
+        if ckpt_path is None:
+            ckpt_path = os.path.join(exp_dir, 'checkpoint.pth.tar')
+            if not os.path.exists(ckpt_path):
+                ckpt_path = os.path.join(exp_dir, 'model_best.pth.tar')
+        if not os.path.exists(ckpt_path):
+            return False
+
+        dev = tt.arg.device
+        if isinstance(dev, str):
+            map_location = torch.device(dev)
+        else:
+            map_location = dev
+
+        state = torch.load(ckpt_path, map_location=map_location, weights_only=False)
+
+        def _align_keys(module, saved_sd):
+            cur = module.state_dict()
+            if not saved_sd or not cur:
+                return saved_sd
+            sk0 = next(iter(saved_sd.keys()))
+            ck0 = next(iter(cur.keys()))
+            if sk0 == ck0:
+                return saved_sd
+            if ck0.startswith('module.') and not sk0.startswith('module.'):
+                return {f'module.{k}': v for k, v in saved_sd.items()}
+            if sk0.startswith('module.') and not ck0.startswith('module.'):
+                return {(k[7:] if k.startswith('module.') else k): v for k, v in saved_sd.items()}
+            return saved_sd
+
+        enc_sd = _align_keys(self.enc_module, state['enc_module_state_dict'])
+        unet_sd = _align_keys(self.unet_module, state['unet_module_state_dict'])
+        self.enc_module.load_state_dict(enc_sd)
+        self.unet_module.load_state_dict(unet_sd)
+
+        if 'optimizer' in state and state['optimizer'] is not None:
+            try:
+                self.optimizer.load_state_dict(state['optimizer'])
+            except Exception as e:
+                print(f'[RESUME] Warning: could not load optimizer state ({e})')
+
+        self.global_step = int(state.get('iteration', 0))
+        self.val_acc = float(state.get('best_val_acc', state.get('val_acc', 0.0)))
+
+        print(f'[RESUME] Loaded {ckpt_path}')
+        print(f'[RESUME] iteration={self.global_step}, best_val_acc={self.val_acc:.4f}')
+        return True
 
     def train(self):#
         val_acc = self.val_acc
@@ -265,6 +329,7 @@ class ModelTrainer(object):
                     'enc_module_state_dict': self.enc_module.state_dict(),
                     'unet_module_state_dict': self.unet_module.state_dict(),
                     'val_acc': val_acc,
+                    'best_val_acc': self.val_acc,
                     'optimizer': self.optimizer.state_dict(),
                 }, is_best)
 
@@ -412,13 +477,14 @@ class ModelTrainer(object):
         return one_hot
 
     def save_checkpoint(self, state, is_best):
-        torch.save(state, 'asset/checkpoints/{}/'.format(tt.arg.experiment) + 'checkpoint.pth.tar')
+        ckpt_file = 'asset/checkpoints/{}/checkpoint.pth.tar'.format(tt.arg.experiment)
+        torch.save(state, ckpt_file)
+        # Always push latest training state so Colab/HF resume is not tied to new bests only
+        _push_checkpoint_to_hf(tt.arg.experiment, 'checkpoint.pth.tar')
         if is_best:
-            shutil.copyfile('asset/checkpoints/{}/'.format(tt.arg.experiment) + 'checkpoint.pth.tar',
-                            'asset/checkpoints/{}/'.format(tt.arg.experiment) + 'model_best.pth.tar')
-            # Push both files to Hugging Face Hub so they survive Colab resets
+            shutil.copyfile(ckpt_file,
+                            'asset/checkpoints/{}/model_best.pth.tar'.format(tt.arg.experiment))
             _push_checkpoint_to_hf(tt.arg.experiment, 'model_best.pth.tar')
-            _push_checkpoint_to_hf(tt.arg.experiment, 'checkpoint.pth.tar')
 
 def set_exp_name():
     exp_name = 'D-{}'.format(tt.arg.dataset)
@@ -589,6 +655,8 @@ if __name__ == '__main__':
     trainer = ModelTrainer(enc_module=enc_module,
                            unet_module=unet_module,
                            data_loader=data_loader)
+
+    trainer.load_checkpoint()
 
     trainer.train()
 
