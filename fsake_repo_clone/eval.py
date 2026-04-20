@@ -153,7 +153,14 @@ if __name__ == '__main__':
                           unet_module=unet_module,
                           data_loader=data_loader)
 
-    checkpoint = torch.load('asset/checkpoints/{}/'.format(tt.arg.exp_name) + 'model_best.pth.tar',map_location=tt.arg.device)
+    # PyTorch>=2.6 defaults torch.load(..., weights_only=True), which breaks
+    # legacy checkpoints containing optimizer/metadata pickled objects.
+    # These checkpoints are produced locally by train.py in this repo.
+    checkpoint = torch.load(
+        'asset/checkpoints/{}/'.format(tt.arg.exp_name) + 'model_best.pth.tar',
+        map_location=tt.arg.device,
+        weights_only=False,
+    )
 
 
     tester.enc_module.load_state_dict(checkpoint['enc_module_state_dict'])
