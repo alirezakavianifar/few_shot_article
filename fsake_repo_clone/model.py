@@ -459,8 +459,7 @@ class LatentMediatorUnet(nn.Module):
         self.norm_support = nn.LayerNorm(in_dim)
         self.norm_query = nn.LayerNorm(in_dim)
         self.norm_mediator = nn.LayerNorm(in_dim)
-
-        self.classifier = nn.Linear(in_dim, num_classes)
+        self.temperature = nn.Parameter(torch.tensor(10.0))
 
     def forward(self, A_init, X):
         del A_init  # kept for compatibility with the Unet/Unet2 interface
@@ -487,8 +486,26 @@ class LatentMediatorUnet(nn.Module):
             support = self.norm_support(support + support_update)
             query = self.norm_query(query + query_update)
 
-        fused = torch.cat([support, query], dim=1)
-        logits = self.classifier(fused)
+        # Episodic support-conditioned classification:
+        # support nodes carry one-hot labels in the last num_classes channels.
+        support_label_probs = support[:, :, -self.num_classes:]
+        support_feat = support[:, :, :-self.num_classes]
+        query_feat = query[:, :, :-self.num_classes]
+
+        class_mass = support_label_probs.sum(dim=1, keepdim=False).unsqueeze(-1) + 1e-6
+        prototypes = torch.bmm(support_label_probs.transpose(1, 2), support_feat) / class_mass
+
+        query_feat = F.normalize(query_feat, p=2, dim=-1)
+        prototypes = F.normalize(prototypes, p=2, dim=-1)
+        query_logits = self.temperature * torch.bmm(query_feat, prototypes.transpose(1, 2))
+
+        # Support logits are not used by current loss, but keep full-node output shape.
+        support_logits = self.temperature * torch.bmm(
+            F.normalize(support_feat, p=2, dim=-1),
+            prototypes.transpose(1, 2),
+        )
+
+        logits = torch.cat([support_logits, query_logits], dim=1)
         out = F.log_softmax(logits, dim=-1)
 
         # Keep output contract identical to existing U-Net blocks.
