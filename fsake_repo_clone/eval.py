@@ -6,6 +6,20 @@ import os
 import random
 from train import ModelTrainer
 
+def _resolve_mediator_heads(embed_dim, requested_heads):
+    """Return a valid head count for MultiheadAttention."""
+    if requested_heads <= 0:
+        requested_heads = 1
+    if embed_dim % requested_heads == 0:
+        return requested_heads
+    for h in range(requested_heads + 1, embed_dim + 1):
+        if embed_dim % h == 0:
+            return h
+    for h in range(requested_heads - 1, 0, -1):
+        if embed_dim % h == 0:
+            return h
+    return 1
+
 
 
 if __name__ == '__main__':
@@ -36,6 +50,11 @@ if __name__ == '__main__':
     tt.arg.mediator_layers = 2 if tt.arg.mediator_layers is None else int(tt.arg.mediator_layers)
     tt.arg.mediator_heads = 4 if tt.arg.mediator_heads is None else int(tt.arg.mediator_heads)
     tt.arg.mediator_dropout = 0.1 if tt.arg.mediator_dropout is None else float(tt.arg.mediator_dropout)
+    fixed_heads = _resolve_mediator_heads(tt.arg.in_dim, tt.arg.mediator_heads)
+    if fixed_heads != tt.arg.mediator_heads:
+        print('[MODEL] adjusted mediator_heads from {} to {} so in_dim={} is divisible'.format(
+            tt.arg.mediator_heads, fixed_heads, tt.arg.in_dim))
+        tt.arg.mediator_heads = fixed_heads
     unet2_flag = False  # the label of using unet2
 
     # confirm ks

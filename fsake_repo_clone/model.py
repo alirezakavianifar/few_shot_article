@@ -427,6 +427,12 @@ class Unet2(nn.Module):
 class LatentMediatorUnet(nn.Module):
     def __init__(self, in_dim, num_classes, num_queries, mediator_tokens=8, mediator_layers=2, mediator_heads=4, mediator_dropout=0.1):
         super(LatentMediatorUnet, self).__init__()
+        if in_dim % mediator_heads != 0:
+            raise ValueError(
+                "LatentMediatorUnet: in_dim ({}) must be divisible by mediator_heads ({}).".format(
+                    in_dim, mediator_heads
+                )
+            )
         self.num_queries = num_queries
         self.num_classes = num_classes
         self.mediator_tokens = mediator_tokens
