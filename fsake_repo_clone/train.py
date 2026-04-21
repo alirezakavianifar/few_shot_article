@@ -1,6 +1,6 @@
 from torchtools import *
 from data import MiniImagenetLoader,TieredImagenetLoader,Cub200Loader,CifarFsLoader
-from model import EmbeddingImagenet, Unet,Unet2
+from model import EmbeddingImagenet, Unet,Unet2, LatentMediatorUnet
 import shutil
 import os
 import random
@@ -491,6 +491,12 @@ def set_exp_name():
     exp_name += '_N-{}_K-{}_Q-{}'.format(tt.arg.num_ways, tt.arg.num_shots,tt.arg.num_queries)
     exp_name += '_B-{}_T-{}'.format(tt.arg.meta_batch_size,tt.arg.transductive)
     exp_name += '_P-{}_Un-{}'.format(tt.arg.pool_mode,tt.arg.unet_mode)
+    if tt.arg.interaction_block == 'lmt':
+        exp_name += '_IB-lmt_M{}L{}H{}'.format(
+            tt.arg.mediator_tokens,
+            tt.arg.mediator_layers,
+            tt.arg.mediator_heads,
+        )
     exp_name += '_SEED-{}'.format(tt.arg.seed)
 
     return exp_name
@@ -518,6 +524,11 @@ if __name__ == '__main__':
 
     tt.arg.pool_mode = 'support'
     tt.arg.unet_mode = 'addold' if tt.arg.unet_mode is None else tt.arg.unet_mode # 'addold'/'noold'
+    tt.arg.interaction_block = 'baseline' if tt.arg.interaction_block is None else str(tt.arg.interaction_block).lower()
+    tt.arg.mediator_tokens = 8 if tt.arg.mediator_tokens is None else int(tt.arg.mediator_tokens)
+    tt.arg.mediator_layers = 2 if tt.arg.mediator_layers is None else int(tt.arg.mediator_layers)
+    tt.arg.mediator_heads = 4 if tt.arg.mediator_heads is None else int(tt.arg.mediator_heads)
+    tt.arg.mediator_dropout = 0.1 if tt.arg.mediator_dropout is None else float(tt.arg.mediator_dropout)
     unet2_flag = False # the label of using unet2
 
     # confirm ks
@@ -596,6 +607,14 @@ if __name__ == '__main__':
     tt.arg.experiment = set_exp_name() if tt.arg.experiment is None else tt.arg.experiment
 
     print(set_exp_name())
+    print('[MODEL] interaction_block={}'.format(tt.arg.interaction_block))
+    if tt.arg.interaction_block == 'lmt':
+        print('[MODEL] mediator_tokens={}, mediator_layers={}, mediator_heads={}, mediator_dropout={}'.format(
+            tt.arg.mediator_tokens,
+            tt.arg.mediator_layers,
+            tt.arg.mediator_heads,
+            tt.arg.mediator_dropout,
+        ))
 
     # set random seed
     np.random.seed(tt.arg.seed)
@@ -620,16 +639,27 @@ if __name__ == '__main__':
 
     enc_module = EmbeddingImagenet(emb_size=tt.arg.emb_size)
 
-    if tt.arg.transductive == False:
-        if unet2_flag == False:
-            unet_module = Unet(tt.arg.ks, tt.arg.in_dim, tt.arg.num_ways, 1)
-        else:
-            unet_module = Unet2(tt.arg.ks_1, tt.arg.ks_2, mode_1, mode_2, tt.arg.in_dim, tt.arg.num_ways, 1)
+    if tt.arg.interaction_block == 'lmt':
+        unet_module = LatentMediatorUnet(
+            in_dim=tt.arg.in_dim,
+            num_classes=tt.arg.num_ways,
+            num_queries=tt.arg.num_queries,
+            mediator_tokens=tt.arg.mediator_tokens,
+            mediator_layers=tt.arg.mediator_layers,
+            mediator_heads=tt.arg.mediator_heads,
+            mediator_dropout=tt.arg.mediator_dropout,
+        )
     else:
-        if unet2_flag == False:
-            unet_module = Unet(tt.arg.ks, tt.arg.in_dim, tt.arg.num_ways, tt.arg.num_queries)
+        if tt.arg.transductive == False:
+            if unet2_flag == False:
+                unet_module = Unet(tt.arg.ks, tt.arg.in_dim, tt.arg.num_ways, 1)
+            else:
+                unet_module = Unet2(tt.arg.ks_1, tt.arg.ks_2, mode_1, mode_2, tt.arg.in_dim, tt.arg.num_ways, 1)
         else:
-            unet_module = Unet2(tt.arg.ks_1, tt.arg.ks_2, mode_1, mode_2, tt.arg.in_dim, tt.arg.num_ways, tt.arg.num_queries)
+            if unet2_flag == False:
+                unet_module = Unet(tt.arg.ks, tt.arg.in_dim, tt.arg.num_ways, tt.arg.num_queries)
+            else:
+                unet_module = Unet2(tt.arg.ks_1, tt.arg.ks_2, mode_1, mode_2, tt.arg.in_dim, tt.arg.num_ways, tt.arg.num_queries)
 
     if tt.arg.dataset == 'mini':
         train_loader = MiniImagenetLoader(root=tt.arg.dataset_root, partition='train')

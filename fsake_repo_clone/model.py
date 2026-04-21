@@ -422,3 +422,68 @@ class Unet2(nn.Module):
         out5 = F.log_softmax(X, dim=-1)
 
         return out5,out
+
+
+class LatentMediatorUnet(nn.Module):
+    def __init__(self, in_dim, num_classes, num_queries, mediator_tokens=8, mediator_layers=2, mediator_heads=4, mediator_dropout=0.1):
+        super(LatentMediatorUnet, self).__init__()
+        self.num_queries = num_queries
+        self.num_classes = num_classes
+        self.mediator_tokens = mediator_tokens
+
+        self.mediator = nn.Parameter(torch.randn(1, mediator_tokens, in_dim) * 0.02)
+
+        self.support_to_mediator = nn.ModuleList([
+            nn.MultiheadAttention(in_dim, mediator_heads, dropout=mediator_dropout, batch_first=True)
+            for _ in range(mediator_layers)
+        ])
+        self.query_to_mediator = nn.ModuleList([
+            nn.MultiheadAttention(in_dim, mediator_heads, dropout=mediator_dropout, batch_first=True)
+            for _ in range(mediator_layers)
+        ])
+        self.mediator_to_support = nn.ModuleList([
+            nn.MultiheadAttention(in_dim, mediator_heads, dropout=mediator_dropout, batch_first=True)
+            for _ in range(mediator_layers)
+        ])
+        self.mediator_to_query = nn.ModuleList([
+            nn.MultiheadAttention(in_dim, mediator_heads, dropout=mediator_dropout, batch_first=True)
+            for _ in range(mediator_layers)
+        ])
+
+        self.norm_support = nn.LayerNorm(in_dim)
+        self.norm_query = nn.LayerNorm(in_dim)
+        self.norm_mediator = nn.LayerNorm(in_dim)
+
+        self.classifier = nn.Linear(in_dim, num_classes)
+
+    def forward(self, A_init, X):
+        del A_init  # kept for compatibility with the Unet/Unet2 interface
+
+        batch_size, num_nodes, _ = X.size()
+        num_queries = min(self.num_queries, num_nodes)
+        num_supports = num_nodes - num_queries
+
+        support = X[:, :num_supports, :]
+        query = X[:, num_supports:, :]
+        mediator = self.mediator.expand(batch_size, -1, -1)
+
+        for s2m, q2m, m2s, m2q in zip(
+                self.support_to_mediator,
+                self.query_to_mediator,
+                self.mediator_to_support,
+                self.mediator_to_query):
+            m_from_support, _ = s2m(mediator, support, support)
+            m_from_query, _ = q2m(mediator, query, query)
+            mediator = self.norm_mediator(mediator + 0.5 * (m_from_support + m_from_query))
+
+            support_update, _ = m2s(support, mediator, mediator)
+            query_update, _ = m2q(query, mediator, mediator)
+            support = self.norm_support(support + support_update)
+            query = self.norm_query(query + query_update)
+
+        fused = torch.cat([support, query], dim=1)
+        logits = self.classifier(fused)
+        out = F.log_softmax(logits, dim=-1)
+
+        # Keep output contract identical to existing U-Net blocks.
+        return out, out
