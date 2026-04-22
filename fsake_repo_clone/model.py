@@ -427,38 +427,74 @@ class Unet2(nn.Module):
 class LatentMediatorUnet(nn.Module):
     def __init__(self, in_dim, num_classes, num_queries, mediator_tokens=8, mediator_layers=2, mediator_heads=4, mediator_dropout=0.1):
         super(LatentMediatorUnet, self).__init__()
-        if in_dim % mediator_heads != 0:
+        self.feature_dim = in_dim - num_classes
+        if self.feature_dim <= 0:
             raise ValueError(
-                "LatentMediatorUnet: in_dim ({}) must be divisible by mediator_heads ({}).".format(
-                    in_dim, mediator_heads
+                "LatentMediatorUnet: feature_dim must be positive, got in_dim={} and num_classes={}.".format(
+                    in_dim, num_classes
+                )
+            )
+        if self.feature_dim % mediator_heads != 0:
+            raise ValueError(
+                "LatentMediatorUnet: feature_dim ({}) must be divisible by mediator_heads ({}).".format(
+                    self.feature_dim, mediator_heads
                 )
             )
         self.num_queries = num_queries
         self.num_classes = num_classes
         self.mediator_tokens = mediator_tokens
 
-        self.mediator = nn.Parameter(torch.randn(1, mediator_tokens, in_dim) * 0.02)
+        self.mediator = nn.Parameter(torch.randn(1, mediator_tokens, self.feature_dim) * 0.02)
 
         self.support_to_mediator = nn.ModuleList([
-            nn.MultiheadAttention(in_dim, mediator_heads, dropout=mediator_dropout, batch_first=True)
+            nn.MultiheadAttention(self.feature_dim, mediator_heads, dropout=mediator_dropout, batch_first=True)
             for _ in range(mediator_layers)
         ])
         self.query_to_mediator = nn.ModuleList([
-            nn.MultiheadAttention(in_dim, mediator_heads, dropout=mediator_dropout, batch_first=True)
+            nn.MultiheadAttention(self.feature_dim, mediator_heads, dropout=mediator_dropout, batch_first=True)
             for _ in range(mediator_layers)
         ])
         self.mediator_to_support = nn.ModuleList([
-            nn.MultiheadAttention(in_dim, mediator_heads, dropout=mediator_dropout, batch_first=True)
+            nn.MultiheadAttention(self.feature_dim, mediator_heads, dropout=mediator_dropout, batch_first=True)
             for _ in range(mediator_layers)
         ])
         self.mediator_to_query = nn.ModuleList([
-            nn.MultiheadAttention(in_dim, mediator_heads, dropout=mediator_dropout, batch_first=True)
+            nn.MultiheadAttention(self.feature_dim, mediator_heads, dropout=mediator_dropout, batch_first=True)
             for _ in range(mediator_layers)
         ])
 
-        self.norm_support = nn.LayerNorm(in_dim)
-        self.norm_query = nn.LayerNorm(in_dim)
-        self.norm_mediator = nn.LayerNorm(in_dim)
+        self.norm_support = nn.LayerNorm(self.feature_dim)
+        self.norm_query = nn.LayerNorm(self.feature_dim)
+        self.norm_mediator = nn.LayerNorm(self.feature_dim)
+
+        ffn_hidden = self.feature_dim * 2
+        self.ffn_support = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(self.feature_dim, ffn_hidden),
+                nn.GELU(),
+                nn.Dropout(mediator_dropout),
+                nn.Linear(ffn_hidden, self.feature_dim),
+            )
+            for _ in range(mediator_layers)
+        ])
+        self.ffn_query = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(self.feature_dim, ffn_hidden),
+                nn.GELU(),
+                nn.Dropout(mediator_dropout),
+                nn.Linear(ffn_hidden, self.feature_dim),
+            )
+            for _ in range(mediator_layers)
+        ])
+        self.ffn_mediator = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(self.feature_dim, ffn_hidden),
+                nn.GELU(),
+                nn.Dropout(mediator_dropout),
+                nn.Linear(ffn_hidden, self.feature_dim),
+            )
+            for _ in range(mediator_layers)
+        ])
         self.temperature = nn.Parameter(torch.tensor(10.0))
 
     def forward(self, A_init, X):
@@ -468,29 +504,35 @@ class LatentMediatorUnet(nn.Module):
         num_queries = min(self.num_queries, num_nodes)
         num_supports = num_nodes - num_queries
 
-        support = X[:, :num_supports, :]
-        query = X[:, num_supports:, :]
+        support_label_probs = X[:, :num_supports, -self.num_classes:]
+        support = X[:, :num_supports, :-self.num_classes]
+        query = X[:, num_supports:, :-self.num_classes]
         mediator = self.mediator.expand(batch_size, -1, -1)
 
-        for s2m, q2m, m2s, m2q in zip(
+        for s2m, q2m, m2s, m2q, ffn_s, ffn_q, ffn_m in zip(
                 self.support_to_mediator,
                 self.query_to_mediator,
                 self.mediator_to_support,
-                self.mediator_to_query):
+                self.mediator_to_query,
+                self.ffn_support,
+                self.ffn_query,
+                self.ffn_mediator):
             m_from_support, _ = s2m(mediator, support, support)
             m_from_query, _ = q2m(mediator, query, query)
             mediator = self.norm_mediator(mediator + 0.5 * (m_from_support + m_from_query))
+            mediator = self.norm_mediator(mediator + ffn_m(mediator))
 
             support_update, _ = m2s(support, mediator, mediator)
             query_update, _ = m2q(query, mediator, mediator)
             support = self.norm_support(support + support_update)
             query = self.norm_query(query + query_update)
+            support = self.norm_support(support + ffn_s(support))
+            query = self.norm_query(query + ffn_q(query))
 
         # Episodic support-conditioned classification:
         # support nodes carry one-hot labels in the last num_classes channels.
-        support_label_probs = support[:, :, -self.num_classes:]
-        support_feat = support[:, :, :-self.num_classes]
-        query_feat = query[:, :, :-self.num_classes]
+        support_feat = support
+        query_feat = query
 
         class_mass = support_label_probs.sum(dim=1, keepdim=False).unsqueeze(-1) + 1e-6
         prototypes = torch.bmm(support_label_probs.transpose(1, 2), support_feat) / class_mass

@@ -545,10 +545,11 @@ if __name__ == '__main__':
     tt.arg.mediator_layers = 2 if tt.arg.mediator_layers is None else int(tt.arg.mediator_layers)
     tt.arg.mediator_heads = 4 if tt.arg.mediator_heads is None else int(tt.arg.mediator_heads)
     tt.arg.mediator_dropout = 0.1 if tt.arg.mediator_dropout is None else float(tt.arg.mediator_dropout)
-    fixed_heads = _resolve_mediator_heads(tt.arg.in_dim, tt.arg.mediator_heads)
+    lmt_feature_dim = tt.arg.in_dim - tt.arg.num_ways
+    fixed_heads = _resolve_mediator_heads(lmt_feature_dim, tt.arg.mediator_heads)
     if fixed_heads != tt.arg.mediator_heads:
-        print('[MODEL] adjusted mediator_heads from {} to {} so in_dim={} is divisible'.format(
-            tt.arg.mediator_heads, fixed_heads, tt.arg.in_dim))
+        print('[MODEL] adjusted mediator_heads from {} to {} so feature_dim={} is divisible'.format(
+            tt.arg.mediator_heads, fixed_heads, lmt_feature_dim))
         tt.arg.mediator_heads = fixed_heads
     unet2_flag = False # the label of using unet2
 
