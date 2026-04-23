@@ -24,12 +24,12 @@ def _resolve_mediator_heads(embed_dim, requested_heads):
 
 if __name__ == '__main__':
 
-    tt.arg.device = 'cuda:3' if tt.arg.device is None else tt.arg.device
+    tt.arg.device = 'cuda:0' if tt.arg.device is None else tt.arg.device
     tt.arg.dataset_root = 'dataset'
-    tt.arg.dataset = 'mini'
+    tt.arg.dataset = 'mini' if tt.arg.dataset is None else tt.arg.dataset
     tt.arg.num_ways = 5 if tt.arg.num_ways is None else tt.arg.num_ways
-    tt.arg.num_shots = 1
-    tt.arg.num_queries = tt.arg.num_ways * 1
+    tt.arg.num_shots = 1 if tt.arg.num_shots is None else tt.arg.num_shots
+    tt.arg.num_queries = tt.arg.num_ways * tt.arg.num_shots
     tt.arg.num_supports = tt.arg.num_ways * tt.arg.num_shots
     tt.arg.transductive = True if tt.arg.transductive is None else tt.arg.transductive
     if tt.arg.transductive == False:
@@ -43,7 +43,7 @@ if __name__ == '__main__':
     tt.arg.emb_size = 128
     tt.arg.in_dim = tt.arg.emb_size + tt.arg.num_ways
 
-    tt.arg.pool_mode = 'support'
+    tt.arg.pool_mode = 'support' if tt.arg.pool_mode is None else tt.arg.pool_mode
     tt.arg.unet_mode = 'addold' if tt.arg.unet_mode is None else tt.arg.unet_mode # 'addold'/'noold'
     tt.arg.interaction_block = 'baseline' if tt.arg.interaction_block is None else str(tt.arg.interaction_block).lower()
     tt.arg.mediator_tokens = 8 if tt.arg.mediator_tokens is None else int(tt.arg.mediator_tokens)
