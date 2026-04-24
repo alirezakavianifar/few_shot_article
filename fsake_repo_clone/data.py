@@ -338,14 +338,23 @@ class Cub200Loader(data.Dataset):
                     data_by_class[label].append(image)
                 data = data_by_class
             
-            # Normalize keys to integers
+            # Normalize keys to integers; string class-name keys (e.g. '019.Gray_Catbird')
+            # are mapped to sequential integers in sorted order
             if isinstance(data, dict):
                 data_converted = {}
-                for k, v in data.items():
-                    if isinstance(k, bytes):
-                        new_k = int(k.decode('utf-8'))
-                    elif isinstance(k, str):
+                for i, (k, v) in enumerate(sorted(data.items(), key=lambda x: str(x[0]))):
+                    if isinstance(k, (int, float)):
                         new_k = int(k)
+                    elif isinstance(k, bytes):
+                        try:
+                            new_k = int(k.decode('utf-8'))
+                        except ValueError:
+                            new_k = i
+                    elif isinstance(k, str):
+                        try:
+                            new_k = int(k)
+                        except ValueError:
+                            new_k = i
                     else:
                         new_k = int(k)
                     data_converted[new_k] = v
@@ -464,7 +473,7 @@ class CifarFsLoader(data.Dataset):
                 u.encoding = 'latin1'
                 data = u.load()
         
-        # Check if this is split format
+        # Handle split format with catname2label
         if isinstance(data, dict) and 'catname2label' in data and 'labels' in data and 'data' in data:
             labels = data['labels']
             images = data['data']
@@ -474,15 +483,32 @@ class CifarFsLoader(data.Dataset):
                     data_by_class[label] = []
                 data_by_class[label].append(image)
             data = data_by_class
-        
+        # Handle CIFAR-FS flat format: {'labels': [int,...], 'data': [array,...]}
+        elif isinstance(data, dict) and 'labels' in data and 'data' in data:
+            labels_list = data['labels']
+            images_list = data['data']
+            data_by_class = {}
+            for lbl, img in zip(labels_list, images_list):
+                key = int(lbl) if not isinstance(lbl, int) else lbl
+                data_by_class.setdefault(key, []).append(img)
+            data = data_by_class
+
         # Normalize keys to integers
         if isinstance(data, dict):
             data_converted = {}
             for k, v in data.items():
-                if isinstance(k, bytes):
-                    new_k = int(k.decode('utf-8'))
-                elif isinstance(k, str):
+                if isinstance(k, (int, float)):
                     new_k = int(k)
+                elif isinstance(k, bytes):
+                    try:
+                        new_k = int(k.decode('utf-8'))
+                    except ValueError:
+                        new_k = len(data_converted)
+                elif isinstance(k, str):
+                    try:
+                        new_k = int(k)
+                    except ValueError:
+                        new_k = len(data_converted)
                 else:
                     new_k = int(k)
                 data_converted[new_k] = v
